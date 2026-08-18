@@ -18,6 +18,30 @@ pub enum DifficultyError {
     ZeroTarget,
     #[error("timestamps must be ordered oldest to newest")]
     TimestampOrder,
+    #[error("cumulative proof-of-work overflowed 512 bits")]
+    WorkOverflow,
+}
+
+/// Returns `floor(2^256 / (target + 1))`, the exact work represented by a
+/// valid 256-bit target. A maximum target contributes one unit of work.
+pub fn block_work(target: [u8; 32]) -> Result<U512, DifficultyError> {
+    let target = U256::from_big_endian(&target);
+    if target.is_zero() {
+        return Err(DifficultyError::ZeroTarget);
+    }
+    Ok((U512::one() << 256) / (U512::from(target) + U512::one()))
+}
+
+pub fn add_chain_work(current: U512, target: [u8; 32]) -> Result<U512, DifficultyError> {
+    let (next, overflowed) = current.overflowing_add(block_work(target)?);
+    if overflowed {
+        return Err(DifficultyError::WorkOverflow);
+    }
+    Ok(next)
+}
+
+pub fn chain_work_bytes(work: U512) -> [u8; 64] {
+    work.to_big_endian()
 }
 
 pub fn next_work_target(
@@ -124,6 +148,31 @@ mod tests {
         assert_eq!(
             next_work_target(&history(1, 900), target(10_000)).unwrap(),
             target(300)
+        );
+    }
+
+    #[test]
+    fn block_work_uses_exact_bitcoin_style_target_math() {
+        assert_eq!(block_work([0xff; 32]).unwrap(), U512::one());
+
+        let mut half_range = [0xff; 32];
+        half_range[0] = 0x7f;
+        assert_eq!(block_work(half_range).unwrap(), U512::from(2_u8));
+
+        let mut target_one = [0_u8; 32];
+        target_one[31] = 1;
+        assert_eq!(block_work(target_one).unwrap(), U512::one() << 255);
+        assert_eq!(block_work([0; 32]), Err(DifficultyError::ZeroTarget));
+    }
+
+    #[test]
+    fn cumulative_work_addition_is_checked_and_canonical() {
+        let work = add_chain_work(U512::from(7_u8), [0xff; 32]).unwrap();
+        assert_eq!(work, U512::from(8_u8));
+        assert_eq!(chain_work_bytes(work)[63], 8);
+        assert_eq!(
+            add_chain_work(U512::MAX, [0xff; 32]),
+            Err(DifficultyError::WorkOverflow)
         );
     }
 }

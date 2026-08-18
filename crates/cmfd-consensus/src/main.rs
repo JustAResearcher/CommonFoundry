@@ -53,8 +53,9 @@ enum Command {
     Profile16gb,
 }
 
-fn sample_block(target: [u8; 32]) -> BlockChallenge {
+fn sample_block(network_id: [u8; 32], target: [u8; 32]) -> BlockChallenge {
     BlockChallenge {
+        network_id,
         previous_block: [0x11; 32],
         transaction_root: [0x22; 32],
         height: 42,
@@ -67,7 +68,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Vector => {
             let verifier = ForgeMatrixVerifier::new(TEST_PROFILE)?;
-            let block = sample_block([0xff; 32]);
+            let block = sample_block([0x33; 32], [0xff; 32]);
             let proof = verifier.prove(&block, 7);
             verifier.verify(&block, &proof)?;
             println!("{}", serde_json::to_string_pretty(&proof)?);
@@ -77,7 +78,7 @@ fn main() -> Result<()> {
             attempts,
         } => {
             let verifier = ForgeMatrixVerifier::new(TEST_PROFILE)?;
-            let block = sample_block(target_with_leading_zero_bits(leading_zero_bits));
+            let block = sample_block([0x33; 32], target_with_leading_zero_bits(leading_zero_bits));
             let proof = verifier
                 .mine(&block, 0, attempts)
                 .with_context(|| format!("no solution in {attempts} attempts"))?;
@@ -90,14 +91,17 @@ fn main() -> Result<()> {
         }
         Command::GpuFixture { output, nonce } => {
             let verifier = ForgeMatrixVerifier::new(TEST_PROFILE)?;
-            let fixture = verifier.gpu_fixture(&sample_block([0xff; 32]), nonce);
+            let fixture = verifier.gpu_fixture(&sample_block([0x33; 32], [0xff; 32]), nonce);
             std::fs::write(&output, fixture)
                 .with_context(|| format!("failed to write {}", output.display()))?;
             println!("wrote {}", output.display());
         }
         Command::GpuFixtureV2 { output, nonce } => {
             let oracle = v2_test_reference()?;
-            let fixture = oracle.gpu_fixture(&sample_block([0xff; 32]), nonce)?;
+            let fixture = oracle.gpu_fixture(
+                &sample_block(oracle.descriptor().network_id, [0xff; 32]),
+                nonce,
+            )?;
             std::fs::write(&output, fixture)
                 .with_context(|| format!("failed to write {}", output.display()))?;
             println!("wrote {}", output.display());

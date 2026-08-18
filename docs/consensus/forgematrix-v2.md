@@ -1,7 +1,9 @@
 # ForgeMatrix v2 recommended research specification
 
-Status: **design target, not an activated consensus algorithm**. The parameter
-set below is the recommended 16 GiB research profile. It is not permission to
+Status: **the production profile is a design target, not an activated consensus
+algorithm**. A separate tiny v2 reference profile is connected to Devnet-0
+block acceptance for local testing. The parameter set below is the recommended
+16 GiB research profile; it remains hard-disabled and is not permission to
 launch a public-value network.
 
 ForgeMatrix v2 is intended to prove the committed matrix relation with a
@@ -351,11 +353,20 @@ comparison. The v2 research code now implements:
 - Rust and CUDA v2 arithmetic smoke vectors that compare initialization and
   every layer after applying fixture-supplied mask coefficients.
 
+Consensus also has canonical bounded, network-aware transaction/proof/block
+wire encodings and network-parameter-bound `Block`/`ChainState` validation.
+Proof tag 1 carries the legacy v1 proof and tag 2 carries a tiny v2 compact
+claim. Devnet-0 uses the tag-2 path with dimension 4, batch 2, and 4 layers.
+The compact claim carries identity and digest fields rather than every witness,
+but its verifier reconstructs the full witness and recomputes every tiny-model
+layer from the pinned model bytes and nonce. It is compact on the wire, not a
+succinct argument or a production proof.
+
 The PCS fields remain opaque manifest values. The toy sumcheck verifier still
 receives the full matrices to recompute multilinear openings, uses only the
-64-bit base field, has no canonical bounded proof wire decoder, is not wired to
-the v2 witness/model/block verifier, and is neither succinct nor
-production-sound. The production-sized v2 constructor is hard-disabled.
+64-bit base field, and is not the proof used by the Devnet-0 block verifier. It
+is neither succinct nor production-sound. The production-sized v2 constructor
+is hard-disabled.
 
 The repository does not yet implement the transparent PCS and byte-link
 certificate, batched all-layer GKR, transition/range sumchecks, >=192-bit

@@ -1,0 +1,26 @@
+[package]
+name = "cmfd-node"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+cmfd-consensus = { path = "../cmfd-consensus" }
+fs2.workspace = true
+hex.workspace = true
+k256.workspace = true
+primitive-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lib]
+name = "cmfd_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cmfd-node"
+path = "src/main.rs"

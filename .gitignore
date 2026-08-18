@@ -1,6 +1,6 @@
 /target/
+/commonfoundry-devnet0/
 *.profraw
 *.profdata
 .idea/
 .vscode/
-

@@ -2,8 +2,9 @@
 //!
 //! This module deliberately does not expose a production block verifier. It
 //! fixes the arithmetic that a future GKR/sumcheck proof must constrain and
-//! supplies a small-profile witness checker for differential and adversarial
-//! testing. Model bytes come from [`crate::model_bank`], never from a seed.
+//! supplies small-profile full-recomputation proofs for devnet, differential,
+//! and adversarial testing. Model bytes come from [`crate::model_bank`], never
+//! from a seed.
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
@@ -142,6 +143,23 @@ pub struct ForgeMatrixV2ReferenceProof {
     pub work_digest: [u8; 32],
 }
 
+/// Compact Devnet-0 proof envelope verified by complete deterministic replay.
+///
+/// This is compact only as a serialized claim: it is not a succinct argument,
+/// does not use the placeholder PCS identities, and cannot activate the
+/// production profile. Every verifier recomputes every matrix layer from the
+/// pinned model bytes and nonce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeMatrixV2CompactProof {
+    pub algorithm_version: u32,
+    pub proof_version: u32,
+    pub nonce: u64,
+    pub model_manifest_digest: [u8; 32],
+    pub challenge_digest: [u8; 32],
+    pub final_activation_digest: [u8; 32],
+    pub work_digest: [u8; 32],
+}
+
 #[derive(Debug, Error)]
 pub enum ForgeMatrixV2Error {
     #[error("ForgeMatrix v2 algorithm version mismatch")]
@@ -150,6 +168,8 @@ pub enum ForgeMatrixV2Error {
     ProofVersion,
     #[error("v2 descriptor contains an uncommitted network, model, or PCS identity")]
     UncommittedDescriptor,
+    #[error("block network does not match the ForgeMatrix v2 descriptor")]
+    WrongNetwork,
     #[error("v2 dimensions and layer banks must be nonzero powers of two and agree")]
     InvalidShape,
     #[error(
@@ -158,6 +178,8 @@ pub enum ForgeMatrixV2Error {
     ProductionDisabled,
     #[error("model bytes do not match the consensus manifest")]
     ModelMismatch,
+    #[error("compact proof model manifest digest mismatch")]
+    ModelManifestDigest,
     #[error("model-bank validation failed: {0}")]
     ModelBank(#[from] ModelBankError),
     #[error("reference witness has the wrong shape")]
@@ -186,6 +208,8 @@ pub enum ForgeMatrixV2Error {
     WorkDigest,
     #[error("work digest does not meet the block target")]
     HighHash,
+    #[error("bounded compact-proof nonce range exhausted")]
+    NonceExhausted,
     #[error("integer arithmetic exceeded the specified v2 bounds")]
     ArithmeticOverflow,
 }
@@ -285,6 +309,80 @@ impl ForgeMatrixV2Reference {
         }
         debug_assert_eq!(fixture.len(), expected_len);
         Ok(fixture)
+    }
+
+    /// Builds a compact Devnet-0 claim after executing the complete reference
+    /// relation. This does not establish succinctness; [`Self::verify_compact`]
+    /// repeats the same full computation.
+    pub fn prove_compact(
+        &self,
+        block: &BlockChallenge,
+        nonce: u64,
+    ) -> Result<ForgeMatrixV2CompactProof, ForgeMatrixV2Error> {
+        let reference = self.prove_reference(block, nonce)?;
+        Ok(ForgeMatrixV2CompactProof {
+            algorithm_version: self.descriptor.algorithm_version,
+            proof_version: self.descriptor.proof_version,
+            nonce,
+            model_manifest_digest: self.descriptor.model.digest()?,
+            challenge_digest: reference.challenge_digest,
+            final_activation_digest: reference.final_activation_digest,
+            work_digest: reference.work_digest,
+        })
+    }
+
+    /// Verifies a compact Devnet-0 claim by recomputing every layer and digest.
+    /// It must never be substituted for the production transparent-PCS proof.
+    pub fn verify_compact(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV2CompactProof,
+    ) -> Result<(), ForgeMatrixV2Error> {
+        if block.network_id != self.descriptor.network_id {
+            return Err(ForgeMatrixV2Error::WrongNetwork);
+        }
+        if proof.algorithm_version != self.descriptor.algorithm_version {
+            return Err(ForgeMatrixV2Error::AlgorithmVersion);
+        }
+        if proof.proof_version != self.descriptor.proof_version {
+            return Err(ForgeMatrixV2Error::ProofVersion);
+        }
+        if proof.model_manifest_digest != self.descriptor.model.digest()? {
+            return Err(ForgeMatrixV2Error::ModelManifestDigest);
+        }
+
+        let expected = self.prove_reference(block, proof.nonce)?;
+        if proof.challenge_digest != expected.challenge_digest {
+            return Err(ForgeMatrixV2Error::ChallengeMismatch);
+        }
+        if proof.final_activation_digest != expected.final_activation_digest {
+            return Err(ForgeMatrixV2Error::OutputDigest);
+        }
+        if proof.work_digest != expected.work_digest {
+            return Err(ForgeMatrixV2Error::WorkDigest);
+        }
+        if expected.work_digest > block.target {
+            return Err(ForgeMatrixV2Error::HighHash);
+        }
+        Ok(())
+    }
+
+    /// Searches a bounded nonce interval using the Devnet-0 full-recomputation
+    /// path. Production mining requires a separate optimized evaluator and a
+    /// winning-nonce succinct prover.
+    pub fn mine_compact(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        attempts: u64,
+    ) -> Result<ForgeMatrixV2CompactProof, ForgeMatrixV2Error> {
+        for offset in 0..attempts {
+            let proof = self.prove_compact(block, start_nonce.wrapping_add(offset))?;
+            if proof.work_digest <= block.target {
+                return Ok(proof);
+            }
+        }
+        Err(ForgeMatrixV2Error::NonceExhausted)
     }
 
     pub fn prove_reference(
@@ -480,6 +578,9 @@ fn challenge_digest(
     block: &BlockChallenge,
     nonce: u64,
 ) -> Result<[u8; 32], ForgeMatrixV2Error> {
+    if block.network_id != descriptor.network_id {
+        return Err(ForgeMatrixV2Error::WrongNetwork);
+    }
     let mut hasher = Hasher::new_derive_key(CHALLENGE_DOMAIN);
     hasher.update(&descriptor.network_id);
     hasher.update(&descriptor.algorithm_version.to_le_bytes());
@@ -679,6 +780,7 @@ mod tests {
 
     fn block() -> BlockChallenge {
         BlockChallenge {
+            network_id: [0x63; 32],
             previous_block: [0x11; 32],
             transaction_root: [0x22; 32],
             height: 42,
@@ -716,6 +818,117 @@ mod tests {
     }
 
     #[test]
+    fn compact_devnet_proof_round_trips_by_full_recomputation() {
+        let oracle = fixture();
+        let proof = oracle.prove_compact(&block(), 7).unwrap();
+        oracle.verify_compact(&block(), &proof).unwrap();
+        assert_eq!(proof.algorithm_version, FORGEMATRIX_V2_ALGORITHM_VERSION);
+        assert_eq!(proof.proof_version, FORGEMATRIX_V2_PROOF_VERSION);
+        assert_eq!(
+            proof.model_manifest_digest,
+            oracle.descriptor.model.digest().unwrap()
+        );
+        assert_eq!(
+            hex::encode(proof.challenge_digest),
+            "2d6700ad9876078ae116476cd57f3536fd7bfdd194340c68c16337a919d1a209"
+        );
+    }
+
+    #[test]
+    fn compact_devnet_public_fields_cannot_be_mutated() {
+        let oracle = fixture();
+        let original = oracle.prove_compact(&block(), 7).unwrap();
+
+        let mut proof = original.clone();
+        proof.algorithm_version += 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::AlgorithmVersion)
+        ));
+
+        let mut proof = original.clone();
+        proof.proof_version += 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::ProofVersion)
+        ));
+
+        let mut proof = original.clone();
+        proof.model_manifest_digest[0] ^= 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::ModelManifestDigest)
+        ));
+
+        let mut proof = original.clone();
+        proof.challenge_digest[0] ^= 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::ChallengeMismatch)
+        ));
+
+        let mut proof = original.clone();
+        proof.final_activation_digest[0] ^= 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::OutputDigest)
+        ));
+
+        let mut proof = original.clone();
+        proof.work_digest[0] ^= 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::WorkDigest)
+        ));
+
+        let mut proof = original;
+        proof.nonce += 1;
+        assert!(matches!(
+            oracle.verify_compact(&block(), &proof),
+            Err(ForgeMatrixV2Error::ChallengeMismatch)
+        ));
+    }
+
+    #[test]
+    fn compact_devnet_network_target_and_nonce_bounds_are_enforced() {
+        let oracle = fixture();
+        let original = block();
+        let proof = oracle.prove_compact(&original, 7).unwrap();
+
+        let mut wrong_network = original;
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            oracle.prove_compact(&wrong_network, 7),
+            Err(ForgeMatrixV2Error::WrongNetwork)
+        ));
+        assert!(matches!(
+            oracle.verify_compact(&wrong_network, &proof),
+            Err(ForgeMatrixV2Error::WrongNetwork)
+        ));
+
+        let mined = oracle.mine_compact(&original, 91, 1).unwrap();
+        assert_eq!(mined.nonce, 91);
+        oracle.verify_compact(&original, &mined).unwrap();
+        assert!(matches!(
+            oracle.mine_compact(&original, 0, 0),
+            Err(ForgeMatrixV2Error::NonceExhausted)
+        ));
+
+        let mut impossible_target = original;
+        impossible_target.target = [0; 32];
+        let high_hash = oracle.prove_compact(&impossible_target, 7).unwrap();
+        assert_ne!(high_hash.work_digest, [0; 32]);
+        assert!(matches!(
+            oracle.verify_compact(&impossible_target, &high_hash),
+            Err(ForgeMatrixV2Error::HighHash)
+        ));
+        assert!(matches!(
+            oracle.mine_compact(&impossible_target, 7, 1),
+            Err(ForgeMatrixV2Error::NonceExhausted)
+        ));
+    }
+
+    #[test]
     fn gpu_fixture_is_canonical_and_complete() {
         let oracle = fixture();
         let fixture = oracle.gpu_fixture(&block(), 7).unwrap();
@@ -730,6 +943,16 @@ mod tests {
         let oracle = fixture();
         let original = block();
         let proof = oracle.prove_reference(&original, 7).unwrap();
+        let mut wrong_network = original;
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            oracle.prove_reference(&wrong_network, 7),
+            Err(ForgeMatrixV2Error::WrongNetwork)
+        ));
+        assert!(matches!(
+            oracle.verify_reference(&wrong_network, &proof),
+            Err(ForgeMatrixV2Error::WrongNetwork)
+        ));
         let mut mutations = Vec::new();
         let mut changed = original;
         changed.previous_block[0] ^= 1;

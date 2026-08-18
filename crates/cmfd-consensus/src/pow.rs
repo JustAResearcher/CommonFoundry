@@ -1,0 +1,220 @@
+use std::sync::Arc;
+
+use blake3::Hasher;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::{
+    BlockChallenge, ForgeMatrixError, ForgeMatrixProfile, ForgeMatrixProof,
+    ForgeMatrixV2CompactProof, ForgeMatrixV2Descriptor, ForgeMatrixV2Error, ForgeMatrixV2Reference,
+    ForgeMatrixVerifier,
+};
+
+pub const POW_TYPE_V1_LEGACY: u16 = 1;
+pub const POW_TYPE_V2_REFERENCE: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowParameters {
+    V1Legacy(ForgeMatrixProfile),
+    V2Reference(ForgeMatrixV2Descriptor),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockProof {
+    V1Legacy(ForgeMatrixProof),
+    V2Reference(ForgeMatrixV2CompactProof),
+}
+
+#[derive(Debug, Error)]
+pub enum PowError {
+    #[error("legacy ForgeMatrix v1 failed: {0}")]
+    V1(#[from] ForgeMatrixError),
+    #[error("ForgeMatrix v2 reference verification failed: {0}")]
+    V2(#[from] ForgeMatrixV2Error),
+    #[error("block proof type does not match the network proof parameters")]
+    WrongProofType,
+    #[error("proof verifier identity does not match the network parameters")]
+    ParameterMismatch,
+    #[error("ForgeMatrix v2 descriptor belongs to another network")]
+    WrongNetwork,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConsensusPowVerifier {
+    V1Legacy(Arc<ForgeMatrixVerifier>),
+    V2Reference(Arc<ForgeMatrixV2Reference>),
+}
+
+impl PowParameters {
+    pub fn validate(self, network_id: [u8; 32]) -> Result<(), PowError> {
+        match self {
+            Self::V1Legacy(profile) => {
+                ForgeMatrixVerifier::new(profile)?;
+            }
+            Self::V2Reference(descriptor) => {
+                if descriptor.network_id != network_id {
+                    return Err(PowError::WrongNetwork);
+                }
+                descriptor.validate_research()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn absorb(self, network_id: [u8; 32], hasher: &mut Hasher) -> Result<(), PowError> {
+        match self {
+            Self::V1Legacy(profile) => {
+                hasher.update(&POW_TYPE_V1_LEGACY.to_le_bytes());
+                hasher.update(&profile.algorithm_version.to_le_bytes());
+                hasher.update(&profile.model_version.to_le_bytes());
+                hasher.update(&profile.dimension.to_le_bytes());
+                hasher.update(&profile.batch.to_le_bytes());
+                hasher.update(&profile.layers.to_le_bytes());
+                hasher.update(&profile.model_seed);
+                let verifier = ForgeMatrixVerifier::new(profile)?;
+                hasher.update(&verifier.model_root());
+            }
+            Self::V2Reference(descriptor) => {
+                if descriptor.network_id != network_id {
+                    return Err(PowError::WrongNetwork);
+                }
+                descriptor.validate_research()?;
+                hasher.update(&POW_TYPE_V2_REFERENCE.to_le_bytes());
+                hasher.update(&descriptor.network_id);
+                hasher.update(&descriptor.algorithm_version.to_le_bytes());
+                hasher.update(&descriptor.proof_version.to_le_bytes());
+                hasher.update(&descriptor.banks.to_le_bytes());
+                hasher.update(&descriptor.layers_per_bank.to_le_bytes());
+                let manifest_digest = descriptor
+                    .model
+                    .digest()
+                    .map_err(ForgeMatrixV2Error::from)?;
+                hasher.update(&manifest_digest);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BlockProof {
+    pub fn proof_type(&self) -> u16 {
+        match self {
+            Self::V1Legacy(_) => POW_TYPE_V1_LEGACY,
+            Self::V2Reference(_) => POW_TYPE_V2_REFERENCE,
+        }
+    }
+
+    pub(crate) fn absorb(&self, hasher: &mut Hasher) {
+        hasher.update(&self.proof_type().to_le_bytes());
+        match self {
+            Self::V1Legacy(proof) => {
+                hasher.update(&proof.algorithm_version.to_le_bytes());
+                hasher.update(&proof.model_version.to_le_bytes());
+                hasher.update(&proof.nonce.to_le_bytes());
+                hasher.update(&proof.model_root);
+                hasher.update(&proof.output_digest);
+                hasher.update(&proof.work_digest);
+            }
+            Self::V2Reference(proof) => {
+                hasher.update(&proof.algorithm_version.to_le_bytes());
+                hasher.update(&proof.proof_version.to_le_bytes());
+                hasher.update(&proof.nonce.to_le_bytes());
+                hasher.update(&proof.model_manifest_digest);
+                hasher.update(&proof.challenge_digest);
+                hasher.update(&proof.final_activation_digest);
+                hasher.update(&proof.work_digest);
+            }
+        }
+    }
+}
+
+impl ConsensusPowVerifier {
+    pub fn v1_legacy(profile: ForgeMatrixProfile) -> Result<Self, PowError> {
+        Ok(Self::V1Legacy(Arc::new(ForgeMatrixVerifier::new(profile)?)))
+    }
+
+    pub fn v2_reference(reference: ForgeMatrixV2Reference) -> Self {
+        Self::V2Reference(Arc::new(reference))
+    }
+
+    pub fn parameters(&self) -> PowParameters {
+        match self {
+            Self::V1Legacy(verifier) => PowParameters::V1Legacy(verifier.profile()),
+            Self::V2Reference(reference) => PowParameters::V2Reference(reference.descriptor()),
+        }
+    }
+
+    pub fn verify(&self, block: &BlockChallenge, proof: &BlockProof) -> Result<(), PowError> {
+        match (self, proof) {
+            (Self::V1Legacy(verifier), BlockProof::V1Legacy(proof)) => {
+                verifier.verify(block, proof)?;
+                Ok(())
+            }
+            (Self::V2Reference(reference), BlockProof::V2Reference(proof)) => {
+                reference.verify_compact(block, proof)?;
+                Ok(())
+            }
+            _ => Err(PowError::WrongProofType),
+        }
+    }
+
+    pub fn mine(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        attempts: u64,
+    ) -> Result<BlockProof, PowError> {
+        match self {
+            Self::V1Legacy(verifier) => Ok(BlockProof::V1Legacy(verifier.mine(
+                block,
+                start_nonce,
+                attempts,
+            )?)),
+            Self::V2Reference(reference) => Ok(BlockProof::V2Reference(reference.mine_compact(
+                block,
+                start_nonce,
+                attempts,
+            )?)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{TEST_PROFILE, v2_test_reference};
+
+    fn block(network_id: [u8; 32]) -> BlockChallenge {
+        BlockChallenge {
+            network_id,
+            previous_block: [1; 32],
+            transaction_root: [2; 32],
+            height: 1,
+            timestamp: 60,
+            target: [0xff; 32],
+        }
+    }
+
+    #[test]
+    fn configured_verifier_rejects_the_other_proof_type() {
+        let v1 = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+        let v2_reference = v2_test_reference().unwrap();
+        let v2_network = v2_reference.descriptor().network_id;
+        let v2_proof =
+            BlockProof::V2Reference(v2_reference.prove_compact(&block(v2_network), 0).unwrap());
+        assert!(matches!(
+            v1.verify(&block(v2_network), &v2_proof),
+            Err(PowError::WrongProofType)
+        ));
+    }
+
+    #[test]
+    fn compact_v2_mines_and_verifies_through_the_common_interface() {
+        let reference = v2_test_reference().unwrap();
+        let network_id = reference.descriptor().network_id;
+        let verifier = ConsensusPowVerifier::v2_reference(reference);
+        let proof = verifier.mine(&block(network_id), 7, 1).unwrap();
+        verifier.verify(&block(network_id), &proof).unwrap();
+        assert_eq!(proof.proof_type(), POW_TYPE_V2_REFERENCE);
+    }
+}

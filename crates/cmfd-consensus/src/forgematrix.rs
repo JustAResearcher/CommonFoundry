@@ -61,6 +61,7 @@ impl ForgeMatrixProfile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockChallenge {
+    pub network_id: [u8; 32],
     pub previous_block: [u8; 32],
     pub transaction_root: [u8; 32],
     pub height: u64,
@@ -323,6 +324,7 @@ fn challenge_digest(
     nonce: u64,
 ) -> [u8; 32] {
     let mut hasher = Hasher::new_derive_key(CHALLENGE_DOMAIN);
+    hasher.update(&block.network_id);
     encode_profile(profile, &mut hasher);
     hasher.update(&model_root);
     hasher.update(&block.previous_block);
@@ -401,6 +403,7 @@ mod tests {
 
     fn block() -> BlockChallenge {
         BlockChallenge {
+            network_id: [0x33; 32],
             previous_block: [0x11; 32],
             transaction_root: [0x22; 32],
             height: 42,
@@ -418,6 +421,19 @@ mod tests {
     }
 
     #[test]
+    fn network_id_is_bound_to_v1_work() {
+        let verifier = ForgeMatrixVerifier::new(TEST_PROFILE).unwrap();
+        let original = block();
+        let proof = verifier.prove(&original, 7);
+        let mut wrong_network = original;
+        wrong_network.network_id[0] ^= 1;
+        assert!(matches!(
+            verifier.verify(&wrong_network, &proof),
+            Err(ForgeMatrixError::OutputDigest)
+        ));
+    }
+
+    #[test]
     fn canonical_vector_is_stable() {
         let verifier = ForgeMatrixVerifier::new(TEST_PROFILE).unwrap();
         let proof = verifier.prove(&block(), 7);
@@ -427,11 +443,11 @@ mod tests {
         );
         assert_eq!(
             hex::encode(proof.output_digest),
-            "ec1137e06ea09ceb8deea073cc2c86c5b604b5eaf33aa08ba6cf4e434d1068df"
+            "b069abab2c640469fac2c59f52fd5f21f4131ffffa8c3cd442384112d5fd6e7e"
         );
         assert_eq!(
             hex::encode(proof.work_digest),
-            "d55204dcc0fc974d33ff59e280043a428d56e50564ed073ef01dd18c2cf93d4a"
+            "05bd64dc7b1e29f896844bc58120924fe7a47f4beeef6313763842855f6591a6"
         );
     }
 

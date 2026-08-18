@@ -6,6 +6,7 @@ use cmfd_consensus::{
 
 fn block() -> BlockChallenge {
     BlockChallenge {
+        network_id: [0x44; 32],
         previous_block: [0x31; 32],
         transaction_root: [0x72; 32],
         height: 9001,
@@ -22,6 +23,9 @@ fn every_header_field_is_bound() {
     assert!(verifier.verify(&original, &proof).is_ok());
 
     let mut mutations = Vec::new();
+    let mut b = original;
+    b.network_id[0] ^= 1;
+    mutations.push(b);
     let mut b = original;
     b.previous_block[0] ^= 1;
     mutations.push(b);
