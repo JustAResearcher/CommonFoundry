@@ -1,0 +1,13 @@
+[package]
+name = "cmfd-marketplace"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3.workspace = true
+k256.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+

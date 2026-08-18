@@ -1,0 +1,26 @@
+[package]
+name = "cmfd-consensus"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+cmfd-marketplace = { path = "../cmfd-marketplace" }
+hex.workspace = true
+k256.workspace = true
+primitive-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lib]
+name = "cmfd_consensus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cmfd-consensus"
+path = "src/main.rs"

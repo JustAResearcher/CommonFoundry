@@ -1,0 +1,371 @@
+# ForgeMatrix v2 recommended research specification
+
+Status: **design target, not an activated consensus algorithm**. The parameter
+set below is the recommended 16 GiB research profile. It is not permission to
+launch a public-value network.
+
+ForgeMatrix v2 is intended to prove the committed matrix relation with a
+transparent succinct argument. It proves neither that a particular GPU was
+used nor that the model was physically resident in GPU VRAM.
+
+## Fixed research profile
+
+| Parameter | Value |
+|---|---:|
+| Batch, `B` | 128 |
+| Dimension, `D` | 4096 |
+| Layers, `L` | 384, organized as 3 banks of 128 |
+| Weight encoding | one raw byte in `0..=250`, decoded as `byte - 125` |
+| Activation encoding | one raw field representative in `0..=250`, decoded as `value - 125` |
+| Transition modulus, `P` | 134,217,689 (prime) |
+| Output alphabet modulus | 251 |
+| Proof base field | Goldilocks, `p = 2^64 - 2^32 + 1` |
+| Transcript challenge space | at least 192 bits; a degree-4 Goldilocks extension is recommended |
+
+The 384 weight matrices contain exactly `384 * 4096 * 4096 =
+6,442,450,944` raw bytes (6 GiB). The base input table contains another
+`128 * 4096 = 524,288` bytes. Each matrix and the base table are row-major.
+Bytes `251..=255` are invalid; generation samples bytes by rejection rather
+than reducing an eight-bit value modulo 251.
+
+The three weight banks contain layers `0..127`, `128..255`, and `256..383`.
+The grouping gives each bank power-of-two multilinear dimensions and has no
+rule that permits a bank or layer to be omitted.
+
+## Model artifact and its two commitments
+
+The model is a published raw artifact, not a 32-byte seed expanded by consensus
+code. Its ordered payload is the base input table followed by `W_0` through
+`W_383`. The canonical model-bank format and manifest fix the model version,
+`B`, `D`, `L`, byte encoding, order and length of every table, byte roots, PCS
+parameter digest, and PCS commitment root. The enclosing consensus descriptor
+separately fixes the network, algorithm/proof versions, and bank layout.
+
+The current canonical file header is exactly 184 bytes in this order:
+
+```text
+8 bytes   ASCII magic "CMFDBNK2"
+u32 LE    format version = 2
+u32 LE    header length = 184
+u32 LE    model version
+u32 LE    dimension D
+u32 LE    batch B
+u32 LE    layer count L
+u64 LE    base-input byte length
+u64 LE    bytes per layer
+u64 LE    total payload bytes
+32 bytes  raw payload BLAKE3 root
+32 bytes  layer-roots aggregate
+32 bytes  PCS parameter digest
+32 bytes  PCS commitment root
+```
+
+The payload immediately follows: base table, then layers `0..L-1`, with no
+trailing bytes. The raw root is ordinary BLAKE3 over that exact payload. For
+each layer, `layer_root_i = BLAKE3(layer_i)`, and
+`layer_roots_aggregate = BLAKE3-derive-key("CMFD/FORGEMATRIX/V2/LAYER-ROOTS",
+u32_le(L) || each u32_le(i) || layer_root_i)`. The manifest digest is
+BLAKE3 derive-key with `"CMFD/FORGEMATRIX/V2/MANIFEST"` over the complete
+canonical 184-byte header.
+
+The manifest carries two distinct bindings:
+
+1. A BLAKE3 byte root identifies the exact raw payload used for distribution
+   and reproducible auditing. A separate domain-separated manifest digest
+   binds that root to the canonical header and all other manifest fields.
+2. A transparent polynomial-commitment-scheme (PCS) commitment binds the field
+   polynomials opened by the block proof.
+
+A one-time, independently verifiable link certificate must prove that every PCS
+entry is the field encoding of the corresponding byte under the BLAKE3 root,
+including the rejection of `251..=255`. Alternatively, every full node may
+stream the complete artifact and deterministically recompute both bindings at
+model activation; that expensive check must produce the same manifest hash.
+A BLAKE3 root by itself is not a PCS commitment, and merely placing both values
+in one manifest does not prove that they describe the same data.
+
+The recommended PCS layout is one multilinear commitment for the base table,
+indexed by 7 row bits and 12 column bits, and one commitment for each 128-layer
+weight bank, indexed by 7 layer bits, 12 common-dimension bits, and 12 output-
+column bits. The scheme must be transparent: no participant-generated trusted
+setup or hidden toxic waste is allowed.
+
+MLE point vectors use the least-significant, fastest-changing row-major axis
+first. The base table uses `[column, row]`; a weight bank uses
+`[column, common, layer]`; activation and witness banks use
+`[column, row, layer]`. The final PCS suite must canonically encode and order
+the base commitment followed by banks 0, 1, and 2, then domain-hash those four
+encodings into `pcs_commitment_root`. The concrete suite ID and wire encoding
+remain to be selected and frozen.
+
+No short public generation seed may be included in the activated manifest.
+This removes the specific consensus-sanctioned shortcut of regenerating each
+layer from a tiny seed. It does not prove that the published bytes are
+information-theoretically incompressible, so the generation ceremony, entropy
+sources, resulting artifact, and structural analyses still require public
+review.
+
+## Block challenge and affine masks
+
+The domain-separated v2 challenge binds, in canonical byte encoding, at least:
+
+- chain identifier and proof-protocol identifier;
+- algorithm version, model version, manifest hash, byte root, and PCS
+  commitments;
+- previous block hash and transaction Merkle root;
+- height, timestamp, the chain-derived difficulty target, and nonce.
+
+For the virtual input layer and every real layer `l` in `0..383`, derive one
+constant coefficient, seven row-bit coefficients, and twelve column-bit
+coefficients from a domain-separated BLAKE3 XOF keyed by the complete block
+challenge and a canonical `u32` layer tag. The virtual layer tag is
+`0xffffffff`; real layer tags are `0..383`. Consume the XOF byte stream in
+order, accept candidates in `0..=250`, and reject `251..=255`. No `% 251`
+reduction is permitted during coefficient sampling.
+
+Writing `r_i` and `c_j` for the little-endian Boolean index bits, define the
+ordinary integer mask
+
+```text
+M(l,r,c) = a_l + sum(i=0..6, br_l[i] * r_i)
+               + sum(j=0..11, bc_l[j] * c_j)
+```
+
+Do not reduce `M` before adding it to the accumulator. It lies in `0..=5000`.
+The same affine expression evaluates its multilinear extension at a verifier's
+random row/column point, avoiding a committed per-cell mask table or a hash
+inside every transition constraint. Coefficient derivation is outside the
+large matrix circuit, but its transcript inputs and rejection-sampling rules
+are consensus data and must be checked by the verifier.
+
+## Base input and layer relation
+
+The committed base table is not used directly. Treat it as a virtual layer:
+decode its entry to `s = base_raw[r,c] - 125`, apply the virtual-layer affine
+mask, and apply the same mod-251 cubic permutation below. Its output is
+`X_0[r,c]`.
+
+For each real layer, decode `W_l[k,c] = weight_raw - 125` and compute
+
+```text
+s_l[r,c] = sum(k = 0..4095) X_l[r,k] * W_l[k,c]
+```
+
+This is an exact signed-integer dot product. Floating point, TF32, stochastic
+rounding, saturation, and wraparound are not part of the relation.
+
+For either the virtual layer or a real layer, first encode the signed `z` into
+the prime transition field `P = 134,217,689`, then apply its cubic permutation
+and reduce only the final field representative to the byte alphabet:
+
+```text
+z = s + M(l,r,c)
+e = z                     when z >= 0
+e = P + z                 when z < 0
+e^2   = P*q2 + r2         with 0 <= e,r2 < P
+r2*e  = P*q3 + h          with 0 <= h < P
+h     = 251*t + v         with 0 <= v <= 250
+next_raw = v
+next_signed = v - 125
+```
+
+For a real layer, `next_signed` is `X_(l+1)[r,c]`; for virtual layer `-1`, it
+is `X_0[r,c]`. `P` is prime and `P mod 3 = 2`, so `gcd(3, P-1) = 1` and cubing
+is a permutation of the transition field. Reducing the dot product directly
+modulo 251 is not equivalent to this function.
+
+### Exact integer bounds
+
+With `D = 4096` and both operands in `[-125,125]`, every real-layer dot product
+obeys
+
+```text
+-64,000,000 <= s <= 64,000,000
+-64,000,000 <= z <= 64,005,000
+0 <= e,r2,h < 134,217,689
+0 <= q2,q3 <= 134,217,687
+0 <= t <= 534,731
+0 <= v <= 250
+-125 <= next_signed <= 125
+```
+
+For the virtual layer, `s` is in `[-125,125]`, `z` is in `[-125,5125]`, and
+the same canonical transition-field encoding applies.
+
+Every dot product and `z` fits in signed 32 bits. The two modular-multiplication
+products fit in unsigned 64 bits and are smaller than the Goldilocks proof
+field. The proof must establish the exact signed dot-product value and its
+range, but consensus cannot mandate an instruction sequence or accumulator
+type; a wider or mathematically equivalent implementation is valid. The full
+allowed `z` interval has width 128,005,000, strictly less than `P`, so its
+canonical residue uniquely identifies the exact integer. This is the defense
+against the earlier search shortcut that discarded high accumulator bits by
+reducing directly modulo 251.
+
+## Succinct proof shape
+
+The recommended proof is a non-zero-knowledge GKR/sumcheck argument backed by a
+transparent multilinear PCS. Zero knowledge adds cost but no consensus benefit
+for this public computation.
+
+- Commit to the permanent base table and three weight-bank multilinear
+  extensions described above.
+- For a winning nonce, commit to activation and witness oracles for `X`, `S`,
+  `E`, `Q2`, `R2`, `Q3`, `H`, `T`, and `V`, plus their range bits, split into
+  the same three 128-layer segments. A segment is indexed by 7 layer bits, 7
+  row bits, and 12 column bits.
+- Prove each matrix product with the claim
+  `S_l(r,c) = sum_k X_l(r,k) * W_l(k,c)`. The reduction over the 12 `k` bits is a
+  degree-2 sumcheck. GKR batching must bind all 384 layers and both segment
+  boundaries, not a sampled subset chosen before the transcript.
+- Prove pointwise the signed-to-`P` encoding, both modular multiplication
+  reductions, `h = 251*t + v`, and `X_(l+1) = v - 125`, including the virtual
+  input layer. Range/lookup arguments must enforce the exact bounds above. In
+  particular, field congruence without range proofs is insufficient.
+- Batch the final PCS openings only after all commitments and claims have been
+  absorbed into the Fiat-Shamir transcript. Canonically reject malformed field
+  encodings, duplicate transcript forms, trailing data, replay under another
+  block or model, and proof malleability.
+
+Goldilocks is the base arithmetic field, but a single base-field challenge is
+not the security target. Transcript challenges and random batching coefficients
+must come from an extension or independent compound challenge space of at least
+192 bits. A degree-4 Goldilocks extension is the conservative default because
+`p^3` is slightly smaller than `2^192`. The complete parameter set must show at
+least 128 bits of overall soundness after the union bound across sumchecks, PCS
+openings, range arguments, and Fiat-Shamir reductions.
+
+A sampled row check or plain Freivalds check is not a substitute for this
+proof. Proof generation should occur only after the miner has computed a nonce
+whose work digest meets the target; requiring a full succinct proof for every
+losing nonce would make the proof system, rather than the matrix work, the
+mining bottleneck.
+
+## Final-activation BLAKE3 gap
+
+The proposed mining digest retains a cheap pre-proof target test:
+
+```text
+final_activation_digest =
+    BLAKE3-derive-key("CMFD/FORGEMATRIX/OUTPUT/V2",
+                      challenge || u64_le(length) || canonical final_raw)
+
+work_digest =
+    BLAKE3-derive-key("CMFD/FORGEMATRIX/WORK/V2",
+                      challenge || model_byte_root || model_PCS_root ||
+                      final_activation_digest)
+```
+
+`canonical final_raw` is the row-major `B * D` table of `v` representatives,
+each encoded as one byte in `0..=250`. `work_digest` is compared as an unsigned
+256-bit big-endian integer with the chain-derived target.
+
+The succinct verifier cannot safely accept `final_activation_digest` as an
+unproved miner claim. Production must do one of the following:
+
+1. arithmetize BLAKE3 and prove that the final activation bytes hash to the
+   digest;
+2. give the verifier all 524,288 final bytes to hash, which adds 512 KiB to
+   every block and violates the preferred total proof-plus-public-witness
+   payload gate; or
+3. adopt a reviewed proof-native final digest in a later algorithm revision and
+   define the target calculation around it.
+
+The repository does not yet close this gap. A proof of the matrix and cubic
+relations that leaves the final BLAKE3 digest unbound is not a valid block
+proof.
+
+## What the proof cannot establish
+
+The argument proves evaluation of the committed function. Software consensus
+cannot prove that the raw bytes physically resided in GPU VRAM, that a GPU was
+used, or that a particular instruction sequence executed. A conforming miner
+may stream the artifact from host memory or use a CPU, FPGA, ASIC, or a more
+efficient equivalent algorithm.
+
+The intended defense is economic: the unverified design hypothesis is that the
+6 GiB bank and repeated dense access make resident GPU execution the fast path
+on a 16 GiB card. Hardware
+attestation could be offered outside consensus, but it would add vendor trust,
+exclude much consumer hardware, and still would not replace the arithmetic
+proof.
+
+No VRAM minimum exists in consensus. An 8 GiB device may retain the raw mining
+bank while staging proof data elsewhere; 2--6 GiB devices may tile or stream
+from host RAM or storage. All remain valid if they compute the exact relation.
+Complete winning-proof memory and speed are unmeasured, and mining eligibility
+is separate from whether a card can host a particular paid inference model.
+
+Activation therefore requires a reproducible comparison using identical nonce
+vectors: fully resident, double-buffered pinned-host streaming, pageable-host
+streaming, on-the-fly lossless regeneration/decompression of the exact v2
+artifact if any is discovered, and the best compressed/decode path. Treat v1
+seed regeneration only as a separate historical negative control because it
+cannot reproduce the seedless v2 bank. Test both enforced 2, 4, 6, and 8 GiB
+caps and representative physical cards. Pin PCIe generation/link width, CPU,
+host-RAM topology and speed, storage, driver, clocks, and power limits. After a
+30-second warmup, run at least five randomized 120-second trials. Record median
+and p95 nonce time, setup time, host-to-device bytes, peak VRAM, host RSS,
+power, and energy. The resident path must be at least four times faster than
+the best valid <=4 GiB or nonresident path on every named baseline card, or the
+profile must change.
+
+## Activation and benchmark gates
+
+Mainnet remains disabled until all of these gates have reproducible evidence:
+
+- a complete proof implementation for all 384 layers, range constraints, model
+  link, final-activation digest, block challenge, nonce, and target;
+- peak device allocation no greater than 13.5 GiB on supported 16 GiB cards,
+  measured end to end rather than inferred from model size;
+- winning-nonce proof generation below 10 seconds, with a target below 5
+  seconds, without changing the proved relation;
+- proof size at most 256 KiB, with 64 KiB as the stretch target, and an explicit
+  separate cap for total proof plus public witness bytes;
+- proof verification below 100 ms on a specified ordinary CPU core;
+- at least 128 bits of documented total soundness with at least 192-bit
+  transcript challenges;
+- two independent prover/verifier implementations with byte-for-byte canonical
+  vectors and CPU/GPU arithmetic differential tests;
+- adversarial tests for skipped layers or output, seed/regeneration shortcuts,
+  sparse or malformed model data, false byte-root/PCS links, invalid ranges,
+  transcript substitution, replay, malleability, target confusion, and
+  arithmetic divergence;
+- audits by at least two independent teams and a public, incentivized testnet.
+
+## Repository implementation status
+
+`cmfd-consensus` retains the ForgeMatrix v1 full-recomputation oracle only for
+comparison. The v2 research code now implements:
+
+- a seedless model-bank format, bounded fixture builder, and 64 KiB-buffered
+  verifier for canonical lengths, bytes in `0..=250`, BLAKE3 roots, and
+  manifest-selected PCS identity fields;
+- a tiny-profile exact integer witness generator/checker for initialization,
+  every GEMM, affine masks, signed transition-field encoding, two modular
+  multiplication reductions, output reduction, centered activation encoding,
+  final digest, and block target;
+- a standalone Fiat--Shamir matrix-multiplication sumcheck skeleton with
+  canonical Goldilocks field representatives in transcript hashing,
+  commitment/transcript mutation tests, and a hard 4096-element research cap;
+- Rust and CUDA v2 arithmetic smoke vectors that compare initialization and
+  every layer after applying fixture-supplied mask coefficients.
+
+The PCS fields remain opaque manifest values. The toy sumcheck verifier still
+receives the full matrices to recompute multilinear openings, uses only the
+64-bit base field, has no canonical bounded proof wire decoder, is not wired to
+the v2 witness/model/block verifier, and is neither succinct nor
+production-sound. The production-sized v2 constructor is hard-disabled.
+
+The repository does not yet implement the transparent PCS and byte-link
+certificate, batched all-layer GKR, transition/range sumchecks, >=192-bit
+extension-field transcript, or in-proof final BLAKE3 binding. The CUDA fixture
+is a differential harness, not a tensor-core miner, succinct prover, low-VRAM
+benchmark, or evidence of residency.
+The CUDA oracle does not independently rederive the BLAKE3 mask coefficients;
+an independent challenge-to-coefficient implementation and a broader vector
+corpus remain required.
+
+Implementing any subset of those components must not make the v2 profile
+activatable. Activation is a separate consensus change after every gate above
+is satisfied.

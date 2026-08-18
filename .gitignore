@@ -1,0 +1,6 @@
+/target/
+*.profraw
+*.profdata
+.idea/
+.vscode/
+
