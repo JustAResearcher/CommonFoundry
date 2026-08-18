@@ -71,8 +71,8 @@ directory:
 .\target\debug\cmfd-node.exe --data-dir .\devnet-0-linear5y\offline status
 ```
 
-`mine-once` uses a public, insecure development key unless a valid
-64-character x-only Schnorr public key is supplied:
+`mine-once` pays this data directory's test wallet unless a valid 64-character
+x-only Schnorr public key is supplied:
 
 ```powershell
 .\target\debug\cmfd-node.exe `
@@ -131,9 +131,14 @@ selects mature, unreserved outputs smallest-first, with a requested maximum of
 reserve their inputs; mine the current consolidation before submitting the next
 batch.
 
-The wallet signs only with the fixed, source-visible Devnet demonstration key.
-Every checkout has the same key. This is a private, valueless test interface,
-not production key custody; never send it real value.
+Each new data directory creates a distinct unencrypted Schnorr test key in
+`wallet.key`. Stop the node before backing up that exact 32-byte file and never
+share it. Unix creation requests mode `0600`; Windows relies on the containing
+directory's ACLs. An existing nonempty Devnet-2 directory retains the old
+source-visible demonstration key during migration so its prior test outputs do
+not become stranded. Neither mode provides encryption, mnemonic recovery,
+hardware-wallet integration, or production custody; never send either real
+value.
 
 The packaged wallet can also connect its embedded node to static private P2P
 peers. See [../apps/wallet/src-tauri/README.md](../apps/wallet/src-tauri/README.md)
@@ -185,7 +190,7 @@ private-LAN testing requires an explicit private bind such as
 `192.168.50.20:18445`, and the URL must use that same reachable numeric IP.
 `--share-leading-zero-bits` may be 0 through 7 on Devnet-0 and defaults to 7;
 smaller values make test shares easier. If `--miner` is omitted, blocks pay the
-fixed, source-visible Devnet destination. A supplied `--miner` must be a
+pool node data directory's wallet destination. A supplied `--miner` must be a
 64-character x-only Schnorr public key.
 
 `pool-serve` owns its selected data directory and starts the TLS pool plus a P2P
@@ -237,9 +242,10 @@ funds or an on-chain balance. The client payout
 field is an untrusted grouping label and does not redirect the miner reward:
 valid pool blocks send that output to the server's `--miner` destination. There
 is no ownership proof, durable or reorganization-aware payout ledger,
-withdrawal transaction, or secure user-key custody. Because every current
-wallet checkout shares the same public demonstration key, the pool cannot
-securely distinguish owners.
+withdrawal transaction, or authenticated payout identity. Per-data-directory
+wallet keys prevent ordinary wallet users from sharing one signing secret, but
+the pool still treats the payout field as an unauthenticated label and cannot
+securely distinguish owners or make payouts.
 
 Before any production use, pool mining still needs unique user and pool keys,
 persistent auditable and reorganization-aware reward accounting, real on-chain
@@ -294,10 +300,10 @@ The first node above uses `http://127.0.0.1:18443`.
 | `GET` | `/health` | Storage health and Devnet identity |
 | `GET` | `/v1/status` | Fingerprint, active tip, cumulative work, target, UTXO count, and mempool totals |
 | `GET` | `/v1/mempool` | Ordered transaction IDs, encoded sizes, burned fees, and pool totals |
-| `GET` | `/v1/wallet` | Shared Devnet destination, active-chain balances, output counts, mempool state, and history |
+| `GET` | `/v1/wallet` | Data-directory wallet destination, active-chain balances, output counts, mempool state, and history |
 | `GET` | `/v1/template?miner=<64-hex-x-only-public-key>` | JSON template containing the current mempool transactions and exact burned fees |
-| `POST` | `/v1/wallet/send` | Sign and admit a shared-key Devnet send from JSON `recipient`, `amount`, and `fee` fields |
-| `POST` | `/v1/wallet/consolidate` | Consolidate mature, unreserved shared-key outputs from JSON `fee` and `max_inputs` fields |
+| `POST` | `/v1/wallet/send` | Sign and admit a test-wallet send from JSON `recipient`, `amount`, and `fee` fields |
+| `POST` | `/v1/wallet/consolidate` | Consolidate mature, unreserved test-wallet outputs from JSON `fee` and `max_inputs` fields |
 | `POST` | `/v1/transaction` | Admit one canonical raw transaction to the volatile mempool |
 | `POST` | `/v1/mine?miner=<64-hex-x-only-public-key>&attempts=<1..1000000>` | Build, mine, validate, persist, and apply one block; body must be empty |
 | `POST` | `/v1/block` | Validate, persist, and index one canonical raw block |
@@ -314,7 +320,8 @@ PowerShell examples while `run` is active:
 
 ```powershell
 $base = 'http://127.0.0.1:18443'
-$miner = '1d16453b3ab3132acb0a5bc16cc49690d819a585267a15cd5a064e2a0ad40599'
+$wallet = Invoke-RestMethod -Uri "$base/v1/wallet"
+$miner = $wallet.destination
 
 Invoke-RestMethod -Uri "$base/health"
 Invoke-RestMethod -Uri "$base/v1/status"
@@ -337,12 +344,12 @@ Invoke-RestMethod -Method Post `
   -InFile .\block.cmfd
 ```
 
-The example miner destination is the source-visible, insecure Devnet key. It is
-appropriate only for this valueless local network. The GUI and wallet RPC build
-and sign transactions with that same fixed key; they do not provide key
-generation, encrypted storage, backup, recovery, or production custody. A raw
-`transaction.cmfd` submitted directly to `/v1/transaction` must still already
-be a correctly signed canonical transaction.
+The example derives the miner destination from the node's wallet rather than a
+hard-coded key. The GUI and wallet RPC sign without returning the private bytes,
+but the local file is unencrypted and there is no mnemonic recovery or
+production custody. A raw `transaction.cmfd` submitted directly to
+`/v1/transaction` must still already be a correctly signed canonical
+transaction.
 
 ## Multi-node acceptance checks
 
@@ -350,7 +357,7 @@ With all three nodes running, mine on A, wait for at least one two-second poll
 round, then compare their live status:
 
 ```powershell
-$miner = '1d16453b3ab3132acb0a5bc16cc49690d819a585267a15cd5a064e2a0ad40599'
+$miner = (Invoke-RestMethod -Uri 'http://127.0.0.1:18443/v1/wallet').destination
 $mineUri = "http://127.0.0.1:18443/v1/mine?miner=$miner&attempts=1000000"
 curl.exe --silent --show-error --request POST `
   --header 'Content-Length: 0' $mineUri | ConvertFrom-Json
@@ -426,11 +433,12 @@ Devnet-0 has no public-peer discovery, peer identity authentication, encrypted
 P2P transport, NAT traversal, reputation/ban system, demonstrated DDoS
 maturity, production wallet/key custody, durable pool payouts, or optimized
 GPU miner.
-Its local GUI signs with a fixed shared demonstration key, not a user-secured
-secret. The pool's pinned TLS server transport does not change the P2P
-boundary: peer compatibility checks do not establish who operates the remote
-process, and peers never supply the local block-acceptance time. All
-network-facing use must remain on an isolated, valueless private network.
+Its local GUI signs with a distinct per-data-directory key on new installs, but
+that raw key is unencrypted and has no mnemonic recovery or audited custody.
+The pool's pinned TLS server transport does not change the P2P boundary: peer
+compatibility checks do not establish who operates the remote process, and
+peers never supply the local block-acceptance time. All network-facing use must
+remain on an isolated, valueless private network.
 
 The compact v2 proof is also still a full-recomputation reference path. A
 production succinct proof, raw-model commitment ceremony/link, independent

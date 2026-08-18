@@ -56,12 +56,16 @@ volatile and intentionally excludes unconfirmed-parent packages. There is no
 production wallet/key custody, durable pool payout system, or optimized GPU
 miner.
 
-The local Devnet GUI and wallet RPC use one fixed, source-visible signing key
-shared by every checkout. They can display active-chain balances and history,
-sign sends, mine development blocks, and consolidate mature unreserved outputs,
-but they provide no key generation, encrypted storage, backup, or recovery.
-They are private Devnet test tools for valueless funds, not a production wallet.
-Never use the shared destination for real value.
+New local Devnet data directories generate distinct Schnorr test keys and store
+the raw 32-byte secret in `wallet.key`. The node does not return that secret
+through RPC or desktop IPC. Existing nonempty Devnet-2 directories retain the
+old source-visible demonstration key during migration so an upgrade cannot
+strand their test outputs. The file is unencrypted: Unix creation requests mode
+`0600`, while Windows relies on the containing data directory's ACLs. Stop the
+node before backing it up and never distribute it. There is no password
+encryption, mnemonic recovery, hardware-wallet integration, or independently
+audited custody. These are valueless private-Devnet test tools, not production
+wallets; never use either key mode for real value.
 
 The native desktop wallet embeds the node and exposes only an explicit Tauri
 command allowlist to its bundled webview. It does not open the loopback HTTP RPC
@@ -107,8 +111,8 @@ nonwithdrawable test counters that reset when the pool process restarts. The
 client payout field is only an untrusted accounting label. The block's miner
 reward output goes to the pool operator's configured destination; there is no
 secure ownership mapping, crash-safe or reorganization-aware accounting,
-withdrawal mechanism, or on-chain payout ledger. Because the current wallet
-key is shared and public, no displayed pool counter represents money owed to a
+withdrawal mechanism, or on-chain payout ledger. Payout labels remain
+unauthenticated, so no displayed pool counter represents money owed to a
 distinct user.
 
 Production pool activation requires unique wallet and pool key custody,

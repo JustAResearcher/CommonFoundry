@@ -170,9 +170,14 @@ See [docs/devnet-0.md](docs/devnet-0.md) for the full pool boundary and
 [apps/wallet/src-tauri/README.md](apps/wallet/src-tauri/README.md) for desktop
 static-peer command-line options.
 
-The signing key is a fixed, source-visible key shared by every Devnet checkout.
-The interface and funds are for private, valueless Devnet-0 testing only. It is
-not production custody software and must never receive real value.
+Each new data directory creates a distinct unencrypted Schnorr test key in
+`wallet.key`; the node never returns its private bytes through RPC or desktop
+IPC. Stop the node before backing up that file and never share it. An existing
+nonempty Devnet-2 directory retains the old public demonstration key during
+migration so an upgrade cannot strand its test outputs. The interface and
+funds remain private, valueless Devnet-0 test tools: there is no encryption,
+mnemonic recovery, hardware-wallet support, or production custody, and the
+wallet must never receive real value.
 
 This is not a public testnet. It has no peer discovery, peer identity
 authentication, encrypted P2P transport, NAT traversal, production wallet/key

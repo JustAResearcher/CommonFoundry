@@ -144,7 +144,7 @@ describe("MiningView", () => {
     expect(screen.getByText("Pool height")).toBeInTheDocument();
     expect(screen.getByText("130")).toBeInTheDocument();
     expect(screen.getByText(/session-only, valueless, and non-withdrawable/i)).toBeInTheDocument();
-    expect(screen.getByText(/shares the Devnet demo wallet key/i)).toBeInTheDocument();
+    expect(screen.getByText(/Payout labels are unauthenticated/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
     expect(urlInput).toBeDisabled();
     expect(workerInput).toBeDisabled();

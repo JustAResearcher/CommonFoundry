@@ -103,7 +103,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         </div>
         <div className="warning-inline">
           <ShieldAlert aria-hidden="true" size={17} />
-          <span>This shared source-visible key is only for valueless private Devnet testing.</span>
+          <span>This unencrypted test key is only for valueless private Devnet testing.</span>
         </div>
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <button className="button-primary wide" type="button" disabled={!wallet || mining} onClick={() => void mine()}>

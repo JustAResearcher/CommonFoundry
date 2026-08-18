@@ -35,7 +35,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
 | **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
 
-This revision describes the `v0.1.0-devnet.2` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+This revision describes the `v0.1.0-devnet.3` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
 
 This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
 
@@ -766,7 +766,7 @@ Normal sends choose mature, unreserved outputs largest-first, then apply a stabl
 
 Miner consolidation deliberately chooses mature, unreserved outputs smallest-first. It spends between 2 and 128 inputs into exactly one self-owned output, minus a burned fee. This removes dust-like reward fragments and keeps later sends within consensus input limits. Consolidation consumes block space and burns a fee; it should be done when fragmentation warrants it, not automatically after every reward.
 
-Current key custody is intentionally unsafe: every source checkout shares a fixed, public Devnet private key. There is no secure key generation, encryption, backup, recovery, hardware-wallet integration, or multi-user isolation. The GUI and wallet must never be used for value.
+Current key custody remains intentionally unsafe. A new data directory generates a distinct Schnorr test key and stores its raw 32-byte secret in `wallet.key`; the browser and RPC do not receive that secret. An existing nonempty Devnet-2 directory retains the old public demonstration key during migration so prior test outputs are not stranded. The file is unencrypted, backup is manual, Windows protection depends on directory ACLs, and there is no mnemonic recovery, hardware-wallet integration, or audited production custody. The GUI and wallet must never be used for value.
 
 ### 11.5 Devnet pool protocol
 
@@ -842,8 +842,8 @@ restart. The default counter adds one test atom per accepted share. These
 numbers are valueless and nonwithdrawable: they are not funds, debt, custody,
 or an on-chain balance. The payout field is an untrusted label and does not
 control the miner reward output. A valid block sends that output to the pool
-server's configured destination. The shared source-visible wallet key also
-prevents secure per-user ownership.
+server's configured destination. Distinct local wallet keys do not fix this:
+the pool has no authenticated payout identity or payout mechanism.
 
 A production pool requires unique user and operator key custody, durable
 auditable share records, reorganization-aware reward maturity and reversal,
@@ -891,7 +891,7 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Parser memory or CPU denial | Bounded canonical framing and proof-specific resource caps | Devnet wire bounded; production proof parser absent |
 | False remote height or work | Treat advertisement as hint and recompute locally | Implemented |
 | Peer spoofing, eclipse, MITM | Authenticated encrypted peer layer, discovery, reputation | Not implemented; private static peers only |
-| Local wallet compromise | Secure custody and process isolation | Not implemented; shared public Devnet key |
+| Local wallet compromise | Encrypted custody, backup/recovery, and process isolation | Distinct unencrypted Devnet keys only; production custody not implemented |
 | VRAM residency claim | No general software proof exists | Explicitly not claimed |
 | Inference correctness | Determinism, redundancy, reputation, or job-specific proof | Receipts only; no general correctness proof |
 
@@ -1137,7 +1137,7 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.2`; the annotated Git tag identifies the exact source commit.
+10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.3`; the annotated Git tag identifies the exact source commit.
 
 ## Appendix F. Non-claims
 
@@ -1156,5 +1156,5 @@ For avoidance of doubt, this paper does not claim that:
 - Devnet pool credits are spendable rewards, a debt, or an on-chain balance;
 - the pinned pool server certificate authenticates workers or Devnet P2P peers;
 - the steward or community destinations are decentralized merely because they are named funds;
-- the private Devnet, shared wallet key, or unsigned prerelease is suitable for value;
+- the private Devnet, its unencrypted test wallet, or an unsigned prerelease is suitable for value;
 - mainnet is ready.
