@@ -215,7 +215,7 @@ export function SendDialog({
         {phase === "edit" && (
           <form className="form-stack" onSubmit={reviewTransaction} noValidate>
             <p className="dialog-description" id="send-dialog-description">
-              Create a signed Devnet transaction using the node's shared demonstration wallet.
+              Create a signed Devnet transaction using this node's test wallet.
             </p>
 
             <div className="form-field">
@@ -315,7 +315,7 @@ export function SendDialog({
 
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              Devnet-0 uses a shared insecure test key. Never send real value.
+              {wallet?.warning ?? "Devnet-0 test wallet unavailable. Never send real value."}
             </p>
 
             <div className="dialog-actions">
@@ -352,7 +352,7 @@ export function SendDialog({
             </div>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              Devnet-0 only · Shared insecure wallet key · Test funds have no value.
+              Devnet-0 only · Unencrypted test wallet · Test funds have no value.
             </p>
             <div className="dialog-actions">
               <button

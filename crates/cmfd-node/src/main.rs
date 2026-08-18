@@ -13,7 +13,7 @@ use cmfd_node::pool::{
 };
 use cmfd_node::{
     DEFAULT_DATA_DIR, DEFAULT_MINING_ATTEMPTS, DEFAULT_P2P_ADDRESS, DEFAULT_RPC_ADDRESS, Node,
-    default_miner_destination, parse_miner_destination, serve_rpc_shared, unix_time_seconds,
+    parse_miner_destination, serve_rpc_shared, unix_time_seconds,
 };
 use serde_json::json;
 
@@ -135,11 +135,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::MineOnce { miner, attempts } => {
+            let mut node = Node::open(&cli.data_dir)?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
-                None => default_miner_destination(),
+                None => node.wallet_destination(),
             };
-            let mut node = Node::open(&cli.data_dir)?;
             let block = node.mine_once(miner_destination, unix_time_seconds()?, attempts)?;
             println!(
                 "{}",
@@ -191,14 +191,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "pool share-leading-zero-bits must be between 0 and 7 on Devnet-0".into(),
                 );
             }
+            let node_instance = Node::open(&cli.data_dir)?;
             let miner_destination = match miner.as_deref() {
                 Some(value) => parse_miner_destination(value)?,
-                None => default_miner_destination(),
+                None => node_instance.wallet_destination(),
             };
             let certificate_der = std::fs::read(&certificate)?;
             let private_key_der = std::fs::read(&private_key)?;
             let pin = certificate_sha256(&certificate_der);
-            let node = Arc::new(Mutex::new(Node::open(&cli.data_dir)?));
+            let node = Arc::new(Mutex::new(node_instance));
             let limits = PeerLimits::default();
             let p2p_socket = TcpListener::bind(p2p_bind)?;
             let p2p_address = p2p_socket.local_addr()?;

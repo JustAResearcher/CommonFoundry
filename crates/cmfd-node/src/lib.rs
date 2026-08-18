@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -47,9 +47,11 @@ pub const MAX_WALLET_HISTORY: usize = 100;
 const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
 const LOCK_FILE: &str = "node.lock";
+const WALLET_KEY_FILE: &str = "wallet.key";
 const METADATA_MAGIC: [u8; 4] = *b"CMFM";
 const METADATA_VERSION: u16 = 1;
 const METADATA_BYTES: usize = 40;
+const METADATA_WALLET_KEY_FLAG: u16 = 1;
 const RECORD_MAGIC: [u8; 4] = *b"CMFR";
 const RECORD_VERSION: u16 = 1;
 const RECORD_HEADER_BYTES: usize = 20;
@@ -60,7 +62,8 @@ const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
-const DEV_WALLET_WARNING: &str = "INSECURE DEVNET-0 DEMO WALLET: the private key is public in the source code; these coins are valueless and this wallet must never be used on a production network.";
+const LEGACY_DEV_WALLET_WARNING: &str = "INSECURE DEVNET-0 LEGACY WALLET: this existing data directory retains the public demonstration key so an upgrade does not strand its test coins. These coins are valueless and this wallet must never be used on a production network.";
+const LOCAL_DEV_WALLET_WARNING: &str = "DEVNET-0 TEST WALLET: this data directory has a unique, unencrypted local private key. Back up wallet.key before testing recovery. These coins are valueless and this wallet must never be used on a production network.";
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -79,6 +82,8 @@ pub enum NodeError {
     MissingMetadata,
     #[error("data directory belongs to a different immutable network fingerprint")]
     FingerprintMismatch,
+    #[error("wallet key is missing, corrupt, or unsupported")]
+    InvalidWalletKey,
     #[error("block log is corrupt: {0}")]
     CorruptLog(String),
     #[error("system clock is before the Unix epoch")]
@@ -173,6 +178,7 @@ impl NodeError {
             Self::InvalidMetadata => ("invalid_metadata", 500, false),
             Self::MissingMetadata => ("missing_metadata", 500, false),
             Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
+            Self::InvalidWalletKey => ("invalid_wallet_key", 500, false),
             Self::CorruptLog(_) => ("corrupt_block_log", 500, false),
             Self::InvalidSystemTime => ("invalid_system_time", 500, false),
             Self::TemplateTimeUnavailable => ("template_time_unavailable", 503, true),
@@ -651,6 +657,8 @@ pub struct Node {
     data_dir: PathBuf,
     params: NetworkParams,
     fingerprint: [u8; 32],
+    wallet_signing_key: SigningKey,
+    legacy_shared_wallet: bool,
     verifier: ConsensusPowVerifier,
     state: ChainState,
     index: BlockIndex,
@@ -808,7 +816,9 @@ impl Node {
         let lock = DataDirLock::acquire(&data_dir)?;
         let params = devnet_params()?;
         let fingerprint = params.fingerprint()?;
-        load_or_create_metadata(&data_dir, fingerprint)?;
+        let metadata = load_metadata(&data_dir, fingerprint)?;
+        let (wallet_signing_key, legacy_shared_wallet) =
+            load_or_create_wallet_key(&data_dir, metadata)?;
 
         let reference = v2_test_reference().map_err(PowError::from)?;
         let verifier = ConsensusPowVerifier::v2_reference(reference);
@@ -822,6 +832,9 @@ impl Node {
             params,
             params.network_id,
         )?;
+        if metadata != MetadataState::Current {
+            write_metadata(&data_dir, fingerprint, metadata)?;
+        }
         let log_path = data_dir.join(BLOCK_LOG_FILE);
         let log = OpenOptions::new()
             .create(true)
@@ -834,6 +847,8 @@ impl Node {
             data_dir,
             params,
             fingerprint,
+            wallet_signing_key,
+            legacy_shared_wallet,
             verifier,
             state,
             index,
@@ -847,6 +862,18 @@ impl Node {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    pub fn wallet_destination(&self) -> [u8; 32] {
+        self.wallet_signing_key.verifying_key().to_bytes().into()
+    }
+
+    fn wallet_warning(&self) -> &'static str {
+        if self.legacy_shared_wallet {
+            LEGACY_DEV_WALLET_WARNING
+        } else {
+            LOCAL_DEV_WALLET_WARNING
+        }
     }
 
     pub fn status(&self) -> Result<NodeStatus, NodeError> {
@@ -867,14 +894,16 @@ impl Node {
         })
     }
 
-    /// Returns the canonical Devnet-0 demo-wallet view.
+    /// Returns the Devnet-0 wallet view for this data directory.
     ///
-    /// The wallet is intentionally fixed to the public development key. Its
-    /// confirmed history is reconstructed from the active branch on every
-    /// call, while balances come from the active UTXO set with the volatile
-    /// mempool applied as a reservation/pending-output overlay.
+    /// New data directories receive a unique unencrypted test key. A directory
+    /// migrated from an older nonempty Devnet retains the public legacy key so
+    /// an upgrade cannot strand its existing test outputs. Confirmed history
+    /// is reconstructed from the active branch on every call, while balances
+    /// come from the active UTXO set with the volatile mempool applied as a
+    /// reservation/pending-output overlay.
     pub fn wallet_snapshot(&self) -> Result<WalletSnapshot, NodeError> {
-        let destination = default_miner_destination();
+        let destination = self.wallet_destination();
         let reserved = mempool_spent_inputs(&self.mempool);
         let mut spendable = 0_u64;
         let mut immature = 0_u64;
@@ -920,7 +949,7 @@ impl Node {
             network: "CommonFoundry Devnet-0",
             devnet_only: true,
             insecure_demo_wallet: true,
-            warning: DEV_WALLET_WARNING,
+            warning: self.wallet_warning(),
             destination: hex::encode(destination),
             accepted_height,
             next_height: self.state.next_height(),
@@ -941,8 +970,8 @@ impl Node {
         })
     }
 
-    /// Validates a display-unit request and submits a payment from the
-    /// intentionally public Devnet-0 demo key.
+    /// Validates a display-unit request and submits a payment from this data
+    /// directory's Devnet-0 test key.
     pub fn send_from_dev_wallet_request(
         &mut self,
         request: WalletSendRequest,
@@ -969,7 +998,7 @@ impl Node {
         let required = amount
             .checked_add(fee_burned)
             .ok_or(NodeError::WalletAmountOverflow)?;
-        let destination = default_miner_destination();
+        let destination = self.wallet_destination();
         let reserved = mempool_spent_inputs(&self.mempool);
         let mut candidates = Vec::new();
         let mut immature = 0_u64;
@@ -1032,8 +1061,7 @@ impl Node {
                 .collect(),
             outputs,
         };
-        let signing_key = insecure_dev_wallet_signing_key();
-        let signing_keys = vec![&signing_key; transaction.inputs.len()];
+        let signing_keys = vec![&self.wallet_signing_key; transaction.inputs.len()];
         transaction.sign_all(&signing_keys)?;
 
         let encoded_bytes = encode_transaction(&transaction)?.len();
@@ -1049,7 +1077,7 @@ impl Node {
             network: "CommonFoundry Devnet-0",
             devnet_only: true,
             insecure_demo_wallet: true,
-            warning: DEV_WALLET_WARNING,
+            warning: self.wallet_warning(),
             txid: hex::encode(entry.txid),
             amount_atoms: amount.to_string(),
             fee_burned_atoms: entry.fee_burned.to_string(),
@@ -1059,8 +1087,8 @@ impl Node {
         })
     }
 
-    /// Validates a display-unit request and consolidates the intentionally
-    /// public Devnet-0 demo wallet.
+    /// Validates a display-unit request and consolidates this data directory's
+    /// Devnet-0 test wallet.
     pub fn consolidate_dev_wallet_request(
         &mut self,
         request: WalletConsolidateRequest,
@@ -1080,7 +1108,7 @@ impl Node {
         if !(2..=MAX_TRANSACTION_INPUTS).contains(&max_inputs) {
             return Err(NodeError::InvalidConsolidationMaxInputs);
         }
-        let destination = default_miner_destination();
+        let destination = self.wallet_destination();
         let reserved = mempool_spent_inputs(&self.mempool);
         let mut candidates: Vec<_> = self
             .state
@@ -1129,8 +1157,7 @@ impl Node {
                 spendable_height: self.state.next_height(),
             }],
         };
-        let signing_key = insecure_dev_wallet_signing_key();
-        let signing_keys = vec![&signing_key; transaction.inputs.len()];
+        let signing_keys = vec![&self.wallet_signing_key; transaction.inputs.len()];
         transaction.sign_all(&signing_keys)?;
         let encoded_bytes = encode_transaction(&transaction)?.len();
         let minimum_fee = required_relay_fee(encoded_bytes);
@@ -1146,7 +1173,7 @@ impl Node {
             network: "CommonFoundry Devnet-0",
             devnet_only: true,
             insecure_demo_wallet: true,
-            warning: DEV_WALLET_WARNING,
+            warning: self.wallet_warning(),
             txid: hex::encode(entry.txid),
             inputs_consolidated,
             input_atoms: input_atoms.to_string(),
@@ -2620,6 +2647,13 @@ fn insecure_dev_wallet_signing_key() -> SigningKey {
         .expect("fixed nonzero development wallet signing key must be valid")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataState {
+    Missing,
+    Legacy,
+    Current,
+}
+
 fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) -> NodeError {
     NodeError::Io {
         operation,
@@ -2628,7 +2662,7 @@ fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) 
     }
 }
 
-fn load_or_create_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<(), NodeError> {
+fn load_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<MetadataState, NodeError> {
     let path = data_dir.join(METADATA_FILE);
     match OpenOptions::new().read(true).open(&path) {
         Ok(mut file) => {
@@ -2648,16 +2682,21 @@ fn load_or_create_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<(),
                     io_error("read network metadata", &path, source)
                 }
             })?;
+            let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
             if bytes[..4] != METADATA_MAGIC
                 || u16::from_le_bytes([bytes[4], bytes[5]]) != METADATA_VERSION
-                || bytes[6..8] != [0, 0]
+                || flags & !METADATA_WALLET_KEY_FLAG != 0
             {
                 return Err(NodeError::InvalidMetadata);
             }
             if bytes[8..40] != fingerprint {
                 return Err(NodeError::FingerprintMismatch);
             }
-            Ok(())
+            if flags & METADATA_WALLET_KEY_FLAG == 0 {
+                Ok(MetadataState::Legacy)
+            } else {
+                Ok(MetadataState::Current)
+            }
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             let log_path = data_dir.join(BLOCK_LOG_FILE);
@@ -2669,23 +2708,132 @@ fn load_or_create_metadata(data_dir: &Path, fingerprint: [u8; 32]) -> Result<(),
                     return Err(io_error("inspect existing block log", &log_path, source));
                 }
             }
-            let mut bytes = Vec::with_capacity(METADATA_BYTES);
-            bytes.extend_from_slice(&METADATA_MAGIC);
-            bytes.extend_from_slice(&METADATA_VERSION.to_le_bytes());
-            bytes.extend_from_slice(&0_u16.to_le_bytes());
-            bytes.extend_from_slice(&fingerprint);
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|source| io_error("create network metadata", &path, source))?;
-            file.write_all(&bytes)
-                .map_err(|source| io_error("write network metadata", &path, source))?;
-            file.sync_all()
-                .map_err(|source| io_error("sync network metadata", &path, source))
+            Ok(MetadataState::Missing)
         }
         Err(source) => Err(io_error("open network metadata", &path, source)),
     }
+}
+
+fn write_metadata(
+    data_dir: &Path,
+    fingerprint: [u8; 32],
+    metadata: MetadataState,
+) -> Result<(), NodeError> {
+    let path = data_dir.join(METADATA_FILE);
+    if metadata == MetadataState::Legacy {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|source| {
+                io_error("open network metadata for wallet migration", &path, source)
+            })?;
+        file.seek(SeekFrom::Start(6)).map_err(|source| {
+            io_error("seek network metadata for wallet migration", &path, source)
+        })?;
+        file.write_all(&METADATA_WALLET_KEY_FLAG.to_le_bytes())
+            .map_err(|source| io_error("write wallet metadata flag", &path, source))?;
+        return file
+            .sync_all()
+            .map_err(|source| io_error("sync network metadata", &path, source));
+    }
+    debug_assert_eq!(metadata, MetadataState::Missing);
+    let mut bytes = Vec::with_capacity(METADATA_BYTES);
+    bytes.extend_from_slice(&METADATA_MAGIC);
+    bytes.extend_from_slice(&METADATA_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&METADATA_WALLET_KEY_FLAG.to_le_bytes());
+    bytes.extend_from_slice(&fingerprint);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|source| io_error("create network metadata", &path, source))?;
+    file.write_all(&bytes)
+        .map_err(|source| io_error("write network metadata", &path, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("sync network metadata", &path, source))
+}
+
+fn load_or_create_wallet_key(
+    data_dir: &Path,
+    metadata: MetadataState,
+) -> Result<(SigningKey, bool), NodeError> {
+    let path = data_dir.join(WALLET_KEY_FILE);
+    match OpenOptions::new().read(true).open(&path) {
+        Ok(mut file) => {
+            if file
+                .metadata()
+                .map_err(|source| io_error("inspect wallet key", &path, source))?
+                .len()
+                != 32
+            {
+                return Err(NodeError::InvalidWalletKey);
+            }
+            let mut secret = [0_u8; 32];
+            file.read_exact(&mut secret)
+                .map_err(|_| NodeError::InvalidWalletKey)?;
+            let key = SigningKey::from_bytes(&secret).map_err(|_| NodeError::InvalidWalletKey)?;
+            let destination: [u8; 32] = key.verifying_key().to_bytes().into();
+            let legacy = destination == default_miner_destination();
+            Ok((key, legacy))
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            if metadata == MetadataState::Current {
+                return Err(NodeError::InvalidWalletKey);
+            }
+            let legacy = metadata == MetadataState::Legacy && block_log_is_nonempty(data_dir)?;
+            let key = if legacy {
+                insecure_dev_wallet_signing_key()
+            } else {
+                random_wallet_signing_key()?
+            };
+            write_wallet_key(&path, &key)?;
+            Ok((key, legacy))
+        }
+        Err(source) => Err(io_error("open wallet key", &path, source)),
+    }
+}
+
+fn block_log_is_nonempty(data_dir: &Path) -> Result<bool, NodeError> {
+    let path = data_dir.join(BLOCK_LOG_FILE);
+    match fs::metadata(&path) {
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("inspect existing block log", &path, source)),
+    }
+}
+
+fn random_wallet_signing_key() -> Result<SigningKey, NodeError> {
+    loop {
+        let mut secret = [0_u8; 32];
+        getrandom::fill(&mut secret).map_err(|source| {
+            io_error(
+                "generate wallet key",
+                WALLET_KEY_FILE,
+                io::Error::other(source.to_string()),
+            )
+        })?;
+        if let Ok(key) = SigningKey::from_bytes(&secret) {
+            return Ok(key);
+        }
+    }
+}
+
+fn write_wallet_key(path: &Path, key: &SigningKey) -> Result<(), NodeError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| io_error("create wallet key", path, source))?;
+    file.write_all(&key.to_bytes())
+        .map_err(|source| io_error("write wallet key", path, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("sync wallet key", path, source))
 }
 
 fn encode_record(accepted_at: u64, block: &[u8]) -> Result<Vec<u8>, NodeError> {
@@ -2916,6 +3064,24 @@ mod tests {
         recipient_secret: u8,
         fee: u64,
     ) -> Transaction {
+        spend_coinbase_to(
+            node,
+            block,
+            output_index,
+            owner_secret,
+            insecure_dev_destination(recipient_secret),
+            fee,
+        )
+    }
+
+    fn spend_coinbase_to(
+        node: &Node,
+        block: &Block,
+        output_index: u32,
+        owner_secret: u8,
+        recipient: [u8; 32],
+        fee: u64,
+    ) -> Transaction {
         let previous_output = &block.coinbase.outputs[output_index as usize];
         let owner = SigningKey::from_bytes(&[owner_secret; 32]).unwrap();
         let mut transaction = Transaction {
@@ -2933,7 +3099,7 @@ mod tests {
             }],
             outputs: vec![TxOutput {
                 value: previous_output.value.checked_sub(fee).unwrap(),
-                lock: OutputLock::Key(insecure_dev_destination(recipient_secret)),
+                lock: OutputLock::Key(recipient),
                 spendable_height: node.state.next_height(),
             }],
         };
@@ -3908,6 +4074,133 @@ mod tests {
     }
 
     #[test]
+    fn new_data_directories_get_distinct_persistent_wallet_keys() {
+        let first_path = test_dir("wallet-key-first");
+        let second_path = test_dir("wallet-key-second");
+        clean_test_dir(&first_path);
+        clean_test_dir(&second_path);
+
+        let first = Node::open(&first_path).unwrap();
+        let first_destination = first.wallet_destination();
+        assert_ne!(first_destination, default_miner_destination());
+        assert_eq!(
+            fs::metadata(first_path.join(WALLET_KEY_FILE))
+                .unwrap()
+                .len(),
+            32
+        );
+        drop(first);
+
+        let reopened = Node::open(&first_path).unwrap();
+        assert_eq!(reopened.wallet_destination(), first_destination);
+        assert!(!reopened.legacy_shared_wallet);
+        drop(reopened);
+
+        let second = Node::open(&second_path).unwrap();
+        assert_ne!(second.wallet_destination(), first_destination);
+        assert!(!second.legacy_shared_wallet);
+        drop(second);
+
+        clean_test_dir(&first_path);
+        clean_test_dir(&second_path);
+    }
+
+    #[test]
+    fn current_metadata_refuses_a_missing_or_corrupt_wallet_key() {
+        let path = test_dir("wallet-key-required");
+        clean_test_dir(&path);
+        drop(Node::open(&path).unwrap());
+
+        fs::remove_file(path.join(WALLET_KEY_FILE)).unwrap();
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::InvalidWalletKey)
+        ));
+
+        fs::write(path.join(WALLET_KEY_FILE), [1_u8; 31]).unwrap();
+        assert!(matches!(
+            Node::open(&path),
+            Err(NodeError::InvalidWalletKey)
+        ));
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn legacy_metadata_with_blocks_imports_the_shared_key_once() {
+        let path = test_dir("wallet-key-legacy");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        node.mine_once(
+            default_miner_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 60,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        drop(node);
+
+        fs::remove_file(path.join(WALLET_KEY_FILE)).unwrap();
+        let metadata_path = path.join(METADATA_FILE);
+        let mut metadata = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&metadata_path)
+            .unwrap();
+        metadata.seek(SeekFrom::Start(6)).unwrap();
+        metadata.write_all(&0_u16.to_le_bytes()).unwrap();
+        metadata.sync_all().unwrap();
+        drop(metadata);
+
+        let migrated = Node::open(&path).unwrap();
+        assert_eq!(migrated.wallet_destination(), default_miner_destination());
+        assert!(migrated.legacy_shared_wallet);
+        assert_eq!(migrated.wallet_warning(), LEGACY_DEV_WALLET_WARNING);
+        drop(migrated);
+
+        let reopened = Node::open(&path).unwrap();
+        assert_eq!(reopened.wallet_destination(), default_miner_destination());
+        assert!(reopened.legacy_shared_wallet);
+        drop(reopened);
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn failed_legacy_replay_does_not_mark_wallet_migration_complete() {
+        let path = test_dir("wallet-key-legacy-replay-failure");
+        clean_test_dir(&path);
+        drop(Node::open(&path).unwrap());
+
+        fs::remove_file(path.join(WALLET_KEY_FILE)).unwrap();
+        let metadata_path = path.join(METADATA_FILE);
+        let mut metadata = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&metadata_path)
+            .unwrap();
+        metadata.seek(SeekFrom::Start(6)).unwrap();
+        metadata.write_all(&0_u16.to_le_bytes()).unwrap();
+        metadata.sync_all().unwrap();
+        drop(metadata);
+        fs::write(path.join(BLOCK_LOG_FILE), b"corrupt").unwrap();
+
+        assert!(matches!(Node::open(&path), Err(NodeError::CorruptLog(_))));
+        let metadata = fs::read(metadata_path).unwrap();
+        assert_eq!(&metadata[6..8], &0_u16.to_le_bytes());
+        let secret: [u8; 32] = fs::read(path.join(WALLET_KEY_FILE))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let key = SigningKey::from_bytes(&secret).unwrap();
+        assert_eq!(
+            <[u8; 32]>::from(key.verifying_key().to_bytes()),
+            default_miner_destination()
+        );
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn missing_metadata_cannot_rebind_an_existing_log() {
         let path = test_dir("missing-metadata");
         clean_test_dir(&path);
@@ -4447,9 +4740,10 @@ mod tests {
         let mut blocks = Vec::new();
         while node.state.next_height() <= height {
             let block_height = node.state.next_height();
+            let destination = node.wallet_destination();
             blocks.push(
                 node.mine_once(
-                    default_miner_destination(),
+                    destination,
                     DEVNET_GENESIS_TIMESTAMP + block_height * 60,
                     DEFAULT_MINING_ATTEMPTS,
                 )
@@ -4551,10 +4845,7 @@ mod tests {
         assert_eq!(snapshot.immature_utxo_count, 0);
         assert_eq!(snapshot.reserved_utxo_count, 0);
         assert!(snapshot.history.is_empty());
-        assert_eq!(
-            snapshot.destination,
-            hex::encode(default_miner_destination())
-        );
+        assert_eq!(snapshot.destination, hex::encode(node.wallet_destination()));
 
         let response = route_rpc_request(
             RpcRequest {
@@ -4571,7 +4862,9 @@ mod tests {
             assert!(value["balances"][field].is_string());
         }
         let serialized = String::from_utf8(response.body).unwrap();
-        assert!(serialized.contains("INSECURE DEVNET-0 DEMO WALLET"));
+        assert!(serialized.contains("DEVNET-0 TEST WALLET"));
+        let wallet_secret = hex::encode(fs::read(path.join(WALLET_KEY_FILE)).unwrap());
+        assert!(!serialized.contains(&wallet_secret));
         assert!(!serialized.contains(&hex::encode([0x13; 32])));
 
         drop(node);
@@ -4672,7 +4965,7 @@ mod tests {
 
         let confirmed_block = node
             .mine_once(
-                default_miner_destination(),
+                node.wallet_destination(),
                 DEVNET_GENESIS_TIMESTAMP + 101 * 60,
                 DEFAULT_MINING_ATTEMPTS,
             )
@@ -4811,7 +5104,7 @@ mod tests {
         clean_test_dir(&path);
         let mut node = Node::open(&path).unwrap();
         let funding = mine_default_chain_to(&mut node, 1).remove(0);
-        let received = spend_coinbase_output(&node, &funding, 1, 0x11, 0x13, 10);
+        let received = spend_coinbase_to(&node, &funding, 1, 0x11, node.wallet_destination(), 10);
         let received_txid = received.txid();
         let received_atoms = received.outputs[0].value;
         node.submit_transaction(received).unwrap();
@@ -4832,7 +5125,7 @@ mod tests {
         );
 
         node.mine_once(
-            default_miner_destination(),
+            node.wallet_destination(),
             DEVNET_GENESIS_TIMESTAMP + 120,
             DEFAULT_MINING_ATTEMPTS,
         )
@@ -4922,16 +5215,15 @@ mod tests {
             outputs: (0..MAX_TRANSACTION_INPUTS)
                 .map(|index| TxOutput {
                     value: per_output + u64::from(index == 0) * remainder,
-                    lock: OutputLock::Key(default_miner_destination()),
+                    lock: OutputLock::Key(node.wallet_destination()),
                     spendable_height: node.state.next_height(),
                 })
                 .collect(),
         };
-        let key = insecure_dev_wallet_signing_key();
-        split.sign_all(&[&key]).unwrap();
+        split.sign_all(&[&node.wallet_signing_key]).unwrap();
         node.submit_transaction(split).unwrap();
         node.mine_once(
-            default_miner_destination(),
+            node.wallet_destination(),
             DEVNET_GENESIS_TIMESTAMP + 101 * 60,
             DEFAULT_MINING_ATTEMPTS,
         )
@@ -4983,7 +5275,7 @@ mod tests {
         assert_eq!(entry.transaction.outputs.len(), 1);
         assert_eq!(
             entry.transaction.outputs[0].lock,
-            OutputLock::Key(default_miner_destination())
+            OutputLock::Key(node.wallet_destination())
         );
         let input_atoms = response_body["input_atoms"]
             .as_str()

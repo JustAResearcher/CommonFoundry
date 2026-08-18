@@ -128,9 +128,9 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
         )}
 
         <div className="warning-panel" role="note">
-          <strong className="warning-title">Devnet-0 only · Shared insecure wallet key</strong>
+          <strong className="warning-title">Devnet-0 only · Unencrypted test wallet</strong>
           <span className="warning-copy">
-            This address is derived from a shared demonstration key. Never send real value.
+            {wallet?.warning ?? "This test wallet is unavailable. Never send real value."}
           </span>
         </div>
 

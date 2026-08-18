@@ -229,7 +229,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               </div>
               <div className="warning-inline pool-credit-note" role="note">
                 <ShieldAlert aria-hidden="true" size={17} />
-                <span>Credits are session-only, valueless, and non-withdrawable. They do not prove secure ownership because every checkout shares the Devnet demo wallet key.</span>
+                <span>Credits are session-only, valueless, and non-withdrawable. Payout labels are unauthenticated and the Devnet pool has no payout mechanism.</span>
               </div>
             </>
           ) : (
