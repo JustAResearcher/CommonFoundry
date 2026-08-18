@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,17 +10,18 @@ use blake3::Hasher;
 use cmfd_consensus::chain::ValidatedBlock;
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
-    BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, ChainError,
+    BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY, EconomicsError,
-    FixedRewardDestinations, MAX_BLOCK_BYTES, MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES,
-    NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
-    PowParameters, Transaction, WireError, add_chain_work, chain_work_bytes, decode_block,
+    FixedRewardDestinations, InputWitness, MAX_BLOCK_BYTES, MAX_FUTURE_OFFSET_SECS,
+    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS, NETWORK_PROTOCOL_VERSION, NetworkError,
+    NetworkParams, OutPoint, OutputLock, PowError, PowParameters, TRANSACTION_VERSION, Transaction,
+    TxInput, TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block,
     decode_transaction, encode_block, encode_transaction, merkle_root, v2_test_reference,
 };
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
 use primitive_types::U512;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
@@ -37,6 +38,7 @@ pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
 pub const MAX_MEMPOOL_TRANSACTIONS: usize = 1_024;
 pub const MAX_MEMPOOL_BYTES: usize = 512 * 1024;
 pub const MIN_RELAY_FEE_PER_KIB: u64 = 1;
+pub const MAX_WALLET_HISTORY: usize = 100;
 
 const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
@@ -53,6 +55,8 @@ const RPC_HEADER_LIMIT: usize = 8 * 1024;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
+const DEV_WALLET_WARNING: &str = "INSECURE DEVNET-0 DEMO WALLET: the private key is public in the source code; these coins are valueless and this wallet must never be used on a production network.";
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -101,6 +105,30 @@ pub enum NodeError {
     MempoolByteLimit,
     #[error("transaction burns a fee of {actual}, below the relay minimum of {required}")]
     MempoolFeeTooLow { required: u64, actual: u64 },
+    #[error("wallet recipient must be a 64-character hex Schnorr public key")]
+    InvalidWalletRecipient,
+    #[error("wallet amount must be an unsigned decimal CMFD value with at most 8 decimal places")]
+    InvalidWalletAmount,
+    #[error("wallet amount arithmetic overflow")]
+    WalletAmountOverflow,
+    #[error("wallet send amount must be nonzero")]
+    WalletZeroAmount,
+    #[error("wallet funds are immature: {immature} atoms immature, {required} atoms required")]
+    WalletFundsImmature { immature: u64, required: u64 },
+    #[error(
+        "wallet has insufficient funds: {available} atoms available, {required} atoms required"
+    )]
+    WalletInsufficientFunds { available: u64, required: u64 },
+    #[error(
+        "wallet send would require more than {MAX_TRANSACTION_INPUTS} inputs: {selected} atoms selected, {required} atoms required"
+    )]
+    WalletInputLimit { selected: u64, required: u64 },
+    #[error("wallet consolidation max_inputs must be between 2 and {MAX_TRANSACTION_INPUTS}")]
+    InvalidConsolidationMaxInputs,
+    #[error("wallet consolidation requires at least two mature unreserved outputs, found {0}")]
+    WalletNotEnoughUtxos(usize),
+    #[error("wallet consolidation fee must be less than its {input} atom input total")]
+    WalletConsolidationFee { input: u64 },
     #[error("RPC request is invalid: {0}")]
     InvalidRpcRequest(String),
     #[error("RPC I/O failed: {0}")]
@@ -152,6 +180,94 @@ pub struct MempoolEntry {
     pub transaction: Transaction,
     pub encoded_bytes: usize,
     pub fee_burned: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletBalances {
+    pub spendable_atoms: String,
+    pub immature_atoms: String,
+    pub pending_atoms: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletMempoolStatus {
+    pub transactions: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletHistoryEntry {
+    pub kind: &'static str,
+    pub txid: String,
+    pub height: Option<u64>,
+    pub timestamp: Option<u64>,
+    pub confirmations: u64,
+    pub status: &'static str,
+    pub net_amount_atoms: String,
+    pub fee_burned_atoms: String,
+    pub counterparty: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletSnapshot {
+    pub network: &'static str,
+    pub devnet_only: bool,
+    pub insecure_demo_wallet: bool,
+    pub warning: &'static str,
+    pub destination: String,
+    pub accepted_height: u64,
+    pub next_height: u64,
+    pub balances: WalletBalances,
+    pub spendable_utxo_count: usize,
+    pub immature_utxo_count: usize,
+    pub reserved_utxo_count: usize,
+    pub mempool: WalletMempoolStatus,
+    pub history_limit: usize,
+    pub history: Vec<WalletHistoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletSendRequest {
+    recipient: String,
+    amount: String,
+    fee: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WalletConsolidateRequest {
+    fee: String,
+    max_inputs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletSendResponse {
+    pub network: &'static str,
+    pub devnet_only: bool,
+    pub insecure_demo_wallet: bool,
+    pub warning: &'static str,
+    pub txid: String,
+    pub amount_atoms: String,
+    pub fee_burned_atoms: String,
+    pub change_atoms: String,
+    pub mempool_transactions: usize,
+    pub mempool_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WalletConsolidateResponse {
+    pub network: &'static str,
+    pub devnet_only: bool,
+    pub insecure_demo_wallet: bool,
+    pub warning: &'static str,
+    pub txid: String,
+    pub inputs_consolidated: usize,
+    pub input_atoms: String,
+    pub output_atoms: String,
+    pub fee_burned_atoms: String,
+    pub mempool_transactions: usize,
+    pub mempool_bytes: usize,
 }
 
 struct DataDirLock {
@@ -321,7 +437,10 @@ pub fn devnet_params() -> Result<NetworkParams, NodeError> {
 }
 
 pub fn default_miner_destination() -> [u8; 32] {
-    insecure_dev_destination(0x13)
+    insecure_dev_wallet_signing_key()
+        .verifying_key()
+        .to_bytes()
+        .into()
 }
 
 pub fn parse_miner_destination(value: &str) -> Result<[u8; 32], NodeError> {
@@ -406,6 +525,471 @@ impl Node {
             mempool_bytes: self.mempool_bytes,
             storage_healthy: !self.storage_faulted,
         })
+    }
+
+    /// Returns the canonical Devnet-0 demo-wallet view.
+    ///
+    /// The wallet is intentionally fixed to the public development key. Its
+    /// confirmed history is reconstructed from the active branch on every
+    /// call, while balances come from the active UTXO set with the volatile
+    /// mempool applied as a reservation/pending-output overlay.
+    pub fn wallet_snapshot(&self) -> Result<WalletSnapshot, NodeError> {
+        let destination = default_miner_destination();
+        let reserved = mempool_spent_inputs(&self.mempool);
+        let mut spendable = 0_u64;
+        let mut immature = 0_u64;
+        let mut spendable_utxo_count = 0_usize;
+        let mut immature_utxo_count = 0_usize;
+        let mut reserved_utxo_count = 0_usize;
+        for (outpoint, output) in self.state.utxos().iter() {
+            if output.lock != OutputLock::Key(destination) {
+                continue;
+            }
+            if self.state.next_height() < output.spendable_height {
+                immature = checked_wallet_add(immature, output.value)?;
+                immature_utxo_count += 1;
+            } else if reserved.contains(outpoint) {
+                reserved_utxo_count += 1;
+            } else {
+                spendable = checked_wallet_add(spendable, output.value)?;
+                spendable_utxo_count += 1;
+            }
+        }
+
+        let mut pending = 0_u64;
+        for entry in self.mempool.values() {
+            for output in &entry.transaction.outputs {
+                if output.lock == OutputLock::Key(destination) {
+                    pending = checked_wallet_add(pending, output.value)?;
+                }
+            }
+        }
+
+        let accepted_height = self.state.next_height().saturating_sub(1);
+        let mut history = self.pending_wallet_history(destination)?;
+        let mut confirmed = self.confirmed_wallet_history(
+            destination,
+            accepted_height,
+            MAX_WALLET_HISTORY.saturating_sub(history.len()),
+        )?;
+        confirmed.reverse();
+        history.extend(confirmed);
+        history.truncate(MAX_WALLET_HISTORY);
+
+        Ok(WalletSnapshot {
+            network: "CommonFoundry Devnet-0",
+            devnet_only: true,
+            insecure_demo_wallet: true,
+            warning: DEV_WALLET_WARNING,
+            destination: hex::encode(destination),
+            accepted_height,
+            next_height: self.state.next_height(),
+            balances: WalletBalances {
+                spendable_atoms: spendable.to_string(),
+                immature_atoms: immature.to_string(),
+                pending_atoms: pending.to_string(),
+            },
+            spendable_utxo_count,
+            immature_utxo_count,
+            reserved_utxo_count,
+            mempool: WalletMempoolStatus {
+                transactions: self.mempool.len(),
+                bytes: self.mempool_bytes,
+            },
+            history_limit: MAX_WALLET_HISTORY,
+            history,
+        })
+    }
+
+    /// Creates and submits a payment from the intentionally public Devnet-0
+    /// demo key. Selection is value-descending with a stable outpoint tie-break
+    /// and never spends a mempool-reserved or immature output.
+    pub fn send_from_dev_wallet(
+        &mut self,
+        recipient: [u8; 32],
+        amount: u64,
+        fee_burned: u64,
+    ) -> Result<WalletSendResponse, NodeError> {
+        VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
+        if amount == 0 {
+            return Err(NodeError::WalletZeroAmount);
+        }
+        let required = amount
+            .checked_add(fee_burned)
+            .ok_or(NodeError::WalletAmountOverflow)?;
+        let destination = default_miner_destination();
+        let reserved = mempool_spent_inputs(&self.mempool);
+        let mut candidates = Vec::new();
+        let mut immature = 0_u64;
+        for (outpoint, output) in self.state.utxos().iter() {
+            if output.lock != OutputLock::Key(destination) {
+                continue;
+            }
+            if self.state.next_height() < output.spendable_height {
+                immature = checked_wallet_add(immature, output.value)?;
+            } else if !reserved.contains(outpoint) {
+                candidates.push((*outpoint, output.value));
+            }
+        }
+        let selection = select_send_utxos(candidates, required)?;
+        let available = selection.available;
+        let selected = selection.outpoints;
+        let selected_value = selection.selected_value;
+        if selected_value < required {
+            if available >= required {
+                return Err(NodeError::WalletInputLimit {
+                    selected: selected_value,
+                    required,
+                });
+            }
+            let available_with_immature = checked_wallet_add(available, immature)?;
+            if available_with_immature >= required {
+                return Err(NodeError::WalletFundsImmature { immature, required });
+            }
+            return Err(NodeError::WalletInsufficientFunds {
+                available,
+                required,
+            });
+        }
+
+        let change = selected_value - required;
+        let mut outputs = vec![TxOutput {
+            value: amount,
+            lock: OutputLock::Key(recipient),
+            spendable_height: self.state.next_height(),
+        }];
+        if change > 0 {
+            outputs.push(TxOutput {
+                value: change,
+                lock: OutputLock::Key(destination),
+                spendable_height: self.state.next_height(),
+            });
+        }
+        let mut transaction = Transaction {
+            network_id: self.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: selected
+                .into_iter()
+                .map(|previous| TxInput {
+                    previous,
+                    witness: InputWitness::Key {
+                        public_key: [0; 32],
+                        signature: Vec::new(),
+                    },
+                })
+                .collect(),
+            outputs,
+        };
+        let signing_key = insecure_dev_wallet_signing_key();
+        let signing_keys = vec![&signing_key; transaction.inputs.len()];
+        transaction.sign_all(&signing_keys)?;
+
+        let encoded_bytes = encode_transaction(&transaction)?.len();
+        let minimum_fee = required_relay_fee(encoded_bytes);
+        if fee_burned < minimum_fee {
+            return Err(NodeError::MempoolFeeTooLow {
+                required: minimum_fee,
+                actual: fee_burned,
+            });
+        }
+        let entry = self.submit_transaction(transaction)?;
+        Ok(WalletSendResponse {
+            network: "CommonFoundry Devnet-0",
+            devnet_only: true,
+            insecure_demo_wallet: true,
+            warning: DEV_WALLET_WARNING,
+            txid: hex::encode(entry.txid),
+            amount_atoms: amount.to_string(),
+            fee_burned_atoms: entry.fee_burned.to_string(),
+            change_atoms: change.to_string(),
+            mempool_transactions: self.mempool.len(),
+            mempool_bytes: self.mempool_bytes,
+        })
+    }
+
+    /// Consolidates the smallest mature, unreserved demo-wallet outputs into
+    /// exactly one immediately spendable self-owned output.
+    pub fn consolidate_dev_wallet(
+        &mut self,
+        fee_burned: u64,
+        max_inputs: usize,
+    ) -> Result<WalletConsolidateResponse, NodeError> {
+        if !(2..=MAX_TRANSACTION_INPUTS).contains(&max_inputs) {
+            return Err(NodeError::InvalidConsolidationMaxInputs);
+        }
+        let destination = default_miner_destination();
+        let reserved = mempool_spent_inputs(&self.mempool);
+        let mut candidates: Vec<_> = self
+            .state
+            .utxos()
+            .iter()
+            .filter(|(outpoint, output)| {
+                output.lock == OutputLock::Key(destination)
+                    && self.state.next_height() >= output.spendable_height
+                    && !reserved.contains(outpoint)
+            })
+            .map(|(outpoint, output)| (*outpoint, output.value))
+            .collect();
+        candidates.sort_unstable_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| left.0.txid.cmp(&right.0.txid))
+                .then_with(|| left.0.index.cmp(&right.0.index))
+        });
+        let selected: Vec<_> = candidates.into_iter().take(max_inputs).collect();
+        if selected.len() < 2 {
+            return Err(NodeError::WalletNotEnoughUtxos(selected.len()));
+        }
+        let input_atoms = selected
+            .iter()
+            .try_fold(0_u64, |total, (_, value)| checked_wallet_add(total, *value))?;
+        let output_atoms = input_atoms
+            .checked_sub(fee_burned)
+            .filter(|value| *value > 0)
+            .ok_or(NodeError::WalletConsolidationFee { input: input_atoms })?;
+        let mut transaction = Transaction {
+            network_id: self.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: selected
+                .iter()
+                .map(|(previous, _)| TxInput {
+                    previous: *previous,
+                    witness: InputWitness::Key {
+                        public_key: [0; 32],
+                        signature: Vec::new(),
+                    },
+                })
+                .collect(),
+            outputs: vec![TxOutput {
+                value: output_atoms,
+                lock: OutputLock::Key(destination),
+                spendable_height: self.state.next_height(),
+            }],
+        };
+        let signing_key = insecure_dev_wallet_signing_key();
+        let signing_keys = vec![&signing_key; transaction.inputs.len()];
+        transaction.sign_all(&signing_keys)?;
+        let encoded_bytes = encode_transaction(&transaction)?.len();
+        let minimum_fee = required_relay_fee(encoded_bytes);
+        if fee_burned < minimum_fee {
+            return Err(NodeError::MempoolFeeTooLow {
+                required: minimum_fee,
+                actual: fee_burned,
+            });
+        }
+        let inputs_consolidated = transaction.inputs.len();
+        let entry = self.submit_transaction(transaction)?;
+        Ok(WalletConsolidateResponse {
+            network: "CommonFoundry Devnet-0",
+            devnet_only: true,
+            insecure_demo_wallet: true,
+            warning: DEV_WALLET_WARNING,
+            txid: hex::encode(entry.txid),
+            inputs_consolidated,
+            input_atoms: input_atoms.to_string(),
+            output_atoms: output_atoms.to_string(),
+            fee_burned_atoms: entry.fee_burned.to_string(),
+            mempool_transactions: self.mempool.len(),
+            mempool_bytes: self.mempool_bytes,
+        })
+    }
+
+    fn pending_wallet_history(
+        &self,
+        destination: [u8; 32],
+    ) -> Result<Vec<WalletHistoryEntry>, NodeError> {
+        let mut history = Vec::new();
+        for entry in self.mempool.values().rev() {
+            let mut wallet_inputs = 0_u64;
+            let mut source = None;
+            for input in &entry.transaction.inputs {
+                let Some(previous) = self.state.utxos().get(&input.previous) else {
+                    continue;
+                };
+                match previous.lock {
+                    OutputLock::Key(owner) if owner == destination => {
+                        wallet_inputs = checked_wallet_add(wallet_inputs, previous.value)?;
+                    }
+                    OutputLock::Key(owner) if source.is_none() => {
+                        source = Some(hex::encode(owner));
+                    }
+                    _ => {}
+                }
+            }
+            let mut wallet_outputs = 0_u64;
+            let mut recipient = None;
+            for output in &entry.transaction.outputs {
+                match output.lock {
+                    OutputLock::Key(owner) if owner == destination => {
+                        wallet_outputs = checked_wallet_add(wallet_outputs, output.value)?;
+                    }
+                    OutputLock::Key(owner) if recipient.is_none() => {
+                        recipient = Some(hex::encode(owner));
+                    }
+                    _ => {}
+                }
+            }
+            let (kind, counterparty) = if wallet_inputs > 0 {
+                ("sent", recipient)
+            } else if wallet_outputs > 0 {
+                ("received", source)
+            } else {
+                continue;
+            };
+            history.push(WalletHistoryEntry {
+                kind,
+                txid: hex::encode(entry.txid),
+                height: None,
+                timestamp: None,
+                confirmations: 0,
+                status: "pending",
+                net_amount_atoms: signed_wallet_delta(wallet_outputs, wallet_inputs),
+                fee_burned_atoms: entry.fee_burned.to_string(),
+                counterparty,
+            });
+            if history.len() == MAX_WALLET_HISTORY {
+                break;
+            }
+        }
+        Ok(history)
+    }
+
+    fn confirmed_wallet_history(
+        &self,
+        destination: [u8; 32],
+        accepted_height: u64,
+        history_limit: usize,
+    ) -> Result<Vec<WalletHistoryEntry>, NodeError> {
+        let mut outputs = HashMap::<OutPoint, TxOutput>::new();
+        let mut history = VecDeque::with_capacity(history_limit);
+        for block_id in self.index.active_chain.iter().skip(1) {
+            let indexed = self.index.blocks.get(block_id).ok_or_else(|| {
+                NodeError::CorruptLog("active wallet history refers to an absent block".to_owned())
+            })?;
+            let block =
+                decode_block(&indexed.canonical, self.params.network_id).map_err(|error| {
+                    NodeError::CorruptLog(format!("active wallet history cannot decode: {error}"))
+                })?;
+            let height = block.challenge.height;
+            let confirmations = accepted_height.saturating_sub(height).saturating_add(1);
+            let coinbase_txid = block.coinbase_outpoint_id();
+            let mut mined = 0_u64;
+            let mut mined_is_immature = false;
+            for (index, output) in block.coinbase.outputs.iter().enumerate() {
+                let outpoint = OutPoint {
+                    txid: coinbase_txid,
+                    index: index as u32,
+                };
+                if output.lock == OutputLock::Key(destination) {
+                    mined = checked_wallet_add(mined, output.value)?;
+                    mined_is_immature |= self.state.next_height() < output.spendable_height;
+                }
+                outputs.insert(outpoint, output.clone());
+            }
+            if mined > 0 {
+                retain_newest_wallet_history(
+                    &mut history,
+                    history_limit,
+                    WalletHistoryEntry {
+                        kind: "mined",
+                        txid: hex::encode(coinbase_txid),
+                        height: Some(height),
+                        timestamp: Some(block.challenge.timestamp),
+                        confirmations,
+                        status: if mined_is_immature {
+                            "immature"
+                        } else {
+                            "confirmed"
+                        },
+                        net_amount_atoms: mined.to_string(),
+                        fee_burned_atoms: "0".to_owned(),
+                        counterparty: None,
+                    },
+                );
+            }
+
+            for transaction in &block.transactions {
+                let mut input_total = 0_u64;
+                let mut wallet_inputs = 0_u64;
+                let mut source = None;
+                for input in &transaction.inputs {
+                    let previous = outputs.remove(&input.previous).ok_or_else(|| {
+                        NodeError::CorruptLog(
+                            "active wallet history transaction refers to an absent output"
+                                .to_owned(),
+                        )
+                    })?;
+                    input_total = checked_wallet_add(input_total, previous.value)?;
+                    match previous.lock {
+                        OutputLock::Key(owner) if owner == destination => {
+                            wallet_inputs = checked_wallet_add(wallet_inputs, previous.value)?;
+                        }
+                        OutputLock::Key(owner) if source.is_none() => {
+                            source = Some(hex::encode(owner));
+                        }
+                        _ => {}
+                    }
+                }
+                let txid = transaction.txid();
+                let mut output_total = 0_u64;
+                let mut wallet_outputs = 0_u64;
+                let mut wallet_outputs_are_immature = false;
+                let mut recipient = None;
+                for (index, output) in transaction.outputs.iter().enumerate() {
+                    output_total = checked_wallet_add(output_total, output.value)?;
+                    match output.lock {
+                        OutputLock::Key(owner) if owner == destination => {
+                            wallet_outputs = checked_wallet_add(wallet_outputs, output.value)?;
+                            wallet_outputs_are_immature |=
+                                self.state.next_height() < output.spendable_height;
+                        }
+                        OutputLock::Key(owner) if recipient.is_none() => {
+                            recipient = Some(hex::encode(owner));
+                        }
+                        _ => {}
+                    }
+                    outputs.insert(
+                        OutPoint {
+                            txid,
+                            index: index as u32,
+                        },
+                        output.clone(),
+                    );
+                }
+                let fee_burned = input_total.checked_sub(output_total).ok_or_else(|| {
+                    NodeError::CorruptLog(
+                        "active wallet history transaction creates value".to_owned(),
+                    )
+                })?;
+                let (kind, counterparty) = if wallet_inputs > 0 {
+                    ("sent", recipient)
+                } else if wallet_outputs > 0 {
+                    ("received", source)
+                } else {
+                    continue;
+                };
+                retain_newest_wallet_history(
+                    &mut history,
+                    history_limit,
+                    WalletHistoryEntry {
+                        kind,
+                        txid: hex::encode(txid),
+                        height: Some(height),
+                        timestamp: Some(block.challenge.timestamp),
+                        confirmations,
+                        status: if wallet_outputs_are_immature {
+                            "immature"
+                        } else {
+                            "confirmed"
+                        },
+                        net_amount_atoms: signed_wallet_delta(wallet_outputs, wallet_inputs),
+                        fee_burned_atoms: fee_burned.to_string(),
+                        counterparty,
+                    },
+                );
+            }
+        }
+        Ok(history.into())
     }
 
     /// Builds the network- and consensus-bound peer greeting. This compatibility
@@ -743,15 +1327,7 @@ fn validate_mempool_transaction(
     }
     let validation =
         state.validate_transactions_for_next_block(std::slice::from_ref(transaction))?;
-    let kib = encoded_bytes
-        .checked_add(1023)
-        .ok_or(NodeError::MempoolByteLimit)?
-        / 1024;
-    let required = u64::try_from(kib)
-        .ok()
-        .and_then(|kib| kib.checked_mul(MIN_RELAY_FEE_PER_KIB))
-        .unwrap_or(u64::MAX)
-        .max(MIN_RELAY_FEE_PER_KIB);
+    let required = required_relay_fee(encoded_bytes);
     if validation.total_burned_fees < required {
         return Err(NodeError::MempoolFeeTooLow {
             required,
@@ -759,6 +1335,79 @@ fn validate_mempool_transaction(
         });
     }
     Ok(validation.total_burned_fees)
+}
+
+fn required_relay_fee(encoded_bytes: usize) -> u64 {
+    let kib = encoded_bytes.saturating_add(1023) / 1024;
+    u64::try_from(kib)
+        .ok()
+        .and_then(|kib| kib.checked_mul(MIN_RELAY_FEE_PER_KIB))
+        .unwrap_or(u64::MAX)
+        .max(MIN_RELAY_FEE_PER_KIB)
+}
+
+fn checked_wallet_add(left: u64, right: u64) -> Result<u64, NodeError> {
+    left.checked_add(right)
+        .ok_or(NodeError::WalletAmountOverflow)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WalletCoinSelection {
+    outpoints: Vec<OutPoint>,
+    selected_value: u64,
+    available: u64,
+}
+
+fn select_send_utxos(
+    mut candidates: Vec<(OutPoint, u64)>,
+    required: u64,
+) -> Result<WalletCoinSelection, NodeError> {
+    let available = candidates
+        .iter()
+        .try_fold(0_u64, |total, (_, value)| checked_wallet_add(total, *value))?;
+    candidates.sort_unstable_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.txid.cmp(&right.0.txid))
+            .then_with(|| left.0.index.cmp(&right.0.index))
+    });
+    let mut outpoints = Vec::new();
+    let mut selected_value = 0_u64;
+    for (outpoint, value) in candidates.into_iter().take(MAX_TRANSACTION_INPUTS) {
+        outpoints.push(outpoint);
+        selected_value = checked_wallet_add(selected_value, value)?;
+        if selected_value >= required {
+            break;
+        }
+    }
+    Ok(WalletCoinSelection {
+        outpoints,
+        selected_value,
+        available,
+    })
+}
+
+fn signed_wallet_delta(credits: u64, debits: u64) -> String {
+    if credits >= debits {
+        (credits - debits).to_string()
+    } else {
+        format!("-{}", debits - credits)
+    }
+}
+
+fn retain_newest_wallet_history(
+    history: &mut VecDeque<WalletHistoryEntry>,
+    limit: usize,
+    entry: WalletHistoryEntry,
+) {
+    if limit == 0 {
+        return;
+    }
+    if history.len() == limit {
+        history.pop_front();
+    }
+    history.push_back(entry);
 }
 
 fn prepare_block(
@@ -1037,6 +1686,122 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
             Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
         },
         ("GET", "/v1/mempool") => RpcResponse::json(200, "OK", mempool_json(node)),
+        ("GET", "/v1/wallet") => match node.wallet_snapshot() {
+            Ok(snapshot) => match serde_json::to_value(snapshot) {
+                Ok(value) => RpcResponse::json(200, "OK", value),
+                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+            },
+            Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+        },
+        ("POST", "/v1/wallet/send") => {
+            if !has_json_content_type(request.content_type.as_deref()) {
+                return RpcResponse::json_error(
+                    415,
+                    "Unsupported Media Type",
+                    "Content-Type must be application/json",
+                );
+            }
+            let send: WalletSendRequest = match serde_json::from_slice(&request.body) {
+                Ok(send) => send,
+                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            };
+            let recipient = match parse_wallet_recipient(&send.recipient) {
+                Ok(recipient) => recipient,
+                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            };
+            let amount = match parse_cmfd_atoms(&send.amount) {
+                Ok(0) => {
+                    return RpcResponse::json_error(
+                        400,
+                        "Bad Request",
+                        NodeError::WalletZeroAmount,
+                    );
+                }
+                Ok(amount) => amount,
+                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            };
+            let fee = match parse_cmfd_atoms(&send.fee) {
+                Ok(fee) => fee,
+                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            };
+            match node.send_from_dev_wallet(recipient, amount, fee) {
+                Ok(response) => match serde_json::to_value(response) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Err(
+                    error @ (NodeError::DuplicateMempoolTransaction(_)
+                    | NodeError::MempoolInputConflict(_)),
+                ) => RpcResponse::json_error(409, "Conflict", error),
+                Err(
+                    error @ (NodeError::WalletFundsImmature { .. }
+                    | NodeError::WalletInsufficientFunds { .. }
+                    | NodeError::WalletInputLimit { .. }
+                    | NodeError::MempoolUnconfirmedInput(_)
+                    | NodeError::MempoolTransactionLimit
+                    | NodeError::MempoolByteLimit
+                    | NodeError::MempoolFeeTooLow { .. }
+                    | NodeError::Chain(_)),
+                ) => RpcResponse::json_error(422, "Unprocessable Content", error),
+                Err(
+                    error @ (NodeError::InvalidWalletRecipient
+                    | NodeError::InvalidWalletAmount
+                    | NodeError::WalletAmountOverflow
+                    | NodeError::WalletZeroAmount),
+                ) => RpcResponse::json_error(400, "Bad Request", error),
+                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+            }
+        }
+        ("POST", "/v1/wallet/consolidate") => {
+            if !has_json_content_type(request.content_type.as_deref()) {
+                return RpcResponse::json_error(
+                    415,
+                    "Unsupported Media Type",
+                    "Content-Type must be application/json",
+                );
+            }
+            let consolidation: WalletConsolidateRequest =
+                match serde_json::from_slice(&request.body) {
+                    Ok(consolidation) => consolidation,
+                    Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+                };
+            if !(2..=MAX_TRANSACTION_INPUTS).contains(&consolidation.max_inputs) {
+                return RpcResponse::json_error(
+                    400,
+                    "Bad Request",
+                    NodeError::InvalidConsolidationMaxInputs,
+                );
+            }
+            let fee = match parse_cmfd_atoms(&consolidation.fee) {
+                Ok(fee) => fee,
+                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            };
+            match node.consolidate_dev_wallet(fee, consolidation.max_inputs) {
+                Ok(response) => match serde_json::to_value(response) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
+                    Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                },
+                Err(
+                    error @ (NodeError::DuplicateMempoolTransaction(_)
+                    | NodeError::MempoolInputConflict(_)),
+                ) => RpcResponse::json_error(409, "Conflict", error),
+                Err(
+                    error @ (NodeError::WalletNotEnoughUtxos(_)
+                    | NodeError::WalletConsolidationFee { .. }
+                    | NodeError::MempoolUnconfirmedInput(_)
+                    | NodeError::MempoolTransactionLimit
+                    | NodeError::MempoolByteLimit
+                    | NodeError::MempoolFeeTooLow { .. }
+                    | NodeError::Chain(_)),
+                ) => RpcResponse::json_error(422, "Unprocessable Content", error),
+                Err(
+                    error @ (NodeError::InvalidConsolidationMaxInputs
+                    | NodeError::InvalidWalletAmount
+                    | NodeError::WalletAmountOverflow),
+                ) => RpcResponse::json_error(400, "Bad Request", error),
+                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+            }
+        }
         ("GET", target) if target.starts_with("/v1/template?") => {
             let miner = match parse_template_miner(target) {
                 Ok(miner) => miner,
@@ -1211,6 +1976,58 @@ fn has_octet_stream_content_type(content_type: Option<&str>) -> bool {
         })
 }
 
+fn has_json_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn parse_wallet_recipient(value: &str) -> Result<[u8; 32], NodeError> {
+    if value.len() != 64 {
+        return Err(NodeError::InvalidWalletRecipient);
+    }
+    let bytes = hex::decode(value).map_err(|_| NodeError::InvalidWalletRecipient)?;
+    let recipient: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| NodeError::InvalidWalletRecipient)?;
+    VerifyingKey::from_bytes(&recipient).map_err(|_| NodeError::InvalidWalletRecipient)?;
+    Ok(recipient)
+}
+
+fn parse_cmfd_atoms(value: &str) -> Result<u64, NodeError> {
+    let mut parts = value.split('.');
+    let whole = parts.next().ok_or(NodeError::InvalidWalletAmount)?;
+    let fractional = parts.next();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(NodeError::InvalidWalletAmount);
+    }
+    let whole_atoms = whole
+        .parse::<u64>()
+        .map_err(|_| NodeError::WalletAmountOverflow)?
+        .checked_mul(COIN)
+        .ok_or(NodeError::WalletAmountOverflow)?;
+    let fractional_atoms = match fractional {
+        None => 0,
+        Some(digits)
+            if !digits.is_empty()
+                && digits.len() <= 8
+                && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let value = digits
+                .parse::<u64>()
+                .map_err(|_| NodeError::InvalidWalletAmount)?;
+            value * 10_u64.pow(8 - digits.len() as u32)
+        }
+        Some(_) => return Err(NodeError::InvalidWalletAmount),
+    };
+    whole_atoms
+        .checked_add(fractional_atoms)
+        .ok_or(NodeError::WalletAmountOverflow)
+}
+
 fn parse_template_miner(target: &str) -> Result<[u8; 32], NodeError> {
     let (path, query) = target
         .split_once('?')
@@ -1321,6 +2138,7 @@ fn mempool_json(node: &Node) -> serde_json::Value {
                 "txid": hex::encode(entry.txid),
                 "encoded_bytes": entry.encoded_bytes,
                 "fee_burned": entry.fee_burned,
+                "fee_burned_atoms": entry.fee_burned.to_string(),
             })
         })
         .collect();
@@ -1446,6 +2264,7 @@ fn read_rpc_request(reader: &mut impl Read) -> Result<RpcRequest, NodeError> {
 fn rpc_body_limit(method: &str, target: &str) -> usize {
     match (method, target) {
         ("POST", "/v1/transaction") => MAX_TRANSACTION_BYTES,
+        ("POST", "/v1/wallet/send" | "/v1/wallet/consolidate") => WALLET_JSON_BODY_LIMIT,
         ("POST", "/v1/block") => MAX_BLOCK_BYTES,
         ("POST", target) if target.starts_with("/v1/mine?") => 0,
         ("GET", _) => 0,
@@ -1472,6 +2291,11 @@ fn insecure_dev_destination(secret_byte: u8) -> [u8; 32] {
     let signing = SigningKey::from_bytes(&[secret_byte; 32])
         .expect("fixed nonzero development signing key must be valid");
     signing.verifying_key().to_bytes().into()
+}
+
+fn insecure_dev_wallet_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x13; 32])
+        .expect("fixed nonzero development wallet signing key must be valid")
 }
 
 fn io_error(operation: &'static str, path: impl AsRef<Path>, source: io::Error) -> NodeError {
@@ -2545,6 +3369,17 @@ mod tests {
             Err(NodeError::InvalidRpcRequest(_))
         ));
 
+        for endpoint in ["/v1/wallet/send", "/v1/wallet/consolidate"] {
+            let oversized_wallet_request = format!(
+                "POST {endpoint} HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                WALLET_JSON_BODY_LIMIT + 1
+            );
+            assert!(matches!(
+                read_rpc_request(&mut oversized_wallet_request.as_bytes()),
+                Err(NodeError::InvalidRpcRequest(_))
+            ));
+        }
+
         let mine_with_body = format!(
             "POST /v1/mine?miner={}&attempts=1 HTTP/1.1\r\nContent-Length: 1\r\n\r\nx",
             hex::encode(default_miner_destination())
@@ -2737,6 +3572,9 @@ mod tests {
         let listed_body: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
         assert_eq!(listed_body["transactions"], 1);
         assert_eq!(listed_body["entries"][0]["txid"], hex::encode(txid));
+        assert_eq!(listed_body["entries"][0]["fee_burned"], 10);
+        assert_eq!(listed_body["entries"][0]["fee_burned_atoms"], "10");
+        assert!(listed_body["entries"][0]["fee_burned_atoms"].is_string());
 
         let mined = route_rpc_request(
             RpcRequest {
@@ -2757,6 +3595,577 @@ mod tests {
         assert_eq!(mined_body["block_id"].as_str().unwrap().len(), 64);
         assert!(node.mempool.is_empty());
         assert_eq!(node.mempool_bytes, 0);
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    fn mine_default_chain_to(node: &mut Node, height: u64) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        while node.state.next_height() <= height {
+            let block_height = node.state.next_height();
+            blocks.push(
+                node.mine_once(
+                    default_miner_destination(),
+                    DEVNET_GENESIS_TIMESTAMP + block_height * 60,
+                    DEFAULT_MINING_ATTEMPTS,
+                )
+                .unwrap(),
+            );
+        }
+        blocks
+    }
+
+    fn wallet_post(target: &str, value: serde_json::Value) -> RpcRequest {
+        RpcRequest {
+            method: "POST".to_owned(),
+            target: target.to_owned(),
+            content_type: Some("application/json; charset=utf-8".to_owned()),
+            body: serde_json::to_vec(&value).unwrap(),
+        }
+    }
+
+    fn synthetic_outpoint(order: u16) -> OutPoint {
+        let mut txid = [0_u8; 32];
+        txid[..2].copy_from_slice(&order.to_be_bytes());
+        OutPoint { txid, index: 0 }
+    }
+
+    #[test]
+    fn send_selection_finds_a_large_coin_beyond_the_old_128_outpoint_prefix() {
+        let mut candidates: Vec<_> = (0..129)
+            .map(|order| (synthetic_outpoint(order), 1_u64))
+            .collect();
+        let large = OutPoint {
+            txid: [0xff; 32],
+            index: 0,
+        };
+        candidates.push((large, 1_000));
+
+        let mut old_outpoint_order = candidates.clone();
+        old_outpoint_order.sort_unstable_by(|left, right| {
+            left.0
+                .txid
+                .cmp(&right.0.txid)
+                .then_with(|| left.0.index.cmp(&right.0.index))
+        });
+        let old_prefix_value: u64 = old_outpoint_order
+            .iter()
+            .take(MAX_TRANSACTION_INPUTS)
+            .map(|(_, value)| value)
+            .sum();
+        assert_eq!(old_prefix_value, MAX_TRANSACTION_INPUTS as u64);
+        assert!(old_prefix_value < 1_000);
+
+        let selection = select_send_utxos(candidates.clone(), 1_000).unwrap();
+        assert_eq!(selection.outpoints, vec![large]);
+        assert_eq!(selection.selected_value, 1_000);
+        assert_eq!(selection.available, 1_129);
+
+        candidates.reverse();
+        assert_eq!(select_send_utxos(candidates, 1_000).unwrap(), selection);
+    }
+
+    #[test]
+    fn send_selection_uses_outpoint_ties_deterministically_and_caps_inputs() {
+        let equal_value_candidates = vec![
+            (synthetic_outpoint(3), 1_000),
+            (synthetic_outpoint(1), 1_000),
+            (synthetic_outpoint(2), 1_000),
+        ];
+        let selection = select_send_utxos(equal_value_candidates, 1_500).unwrap();
+        assert_eq!(
+            selection.outpoints,
+            vec![synthetic_outpoint(1), synthetic_outpoint(2)]
+        );
+        assert_eq!(selection.selected_value, 2_000);
+
+        let candidates: Vec<_> = (0..130)
+            .rev()
+            .map(|order| (synthetic_outpoint(order), 10_u64))
+            .collect();
+        let capped = select_send_utxos(candidates, 1_290).unwrap();
+        assert_eq!(capped.outpoints.len(), MAX_TRANSACTION_INPUTS);
+        assert_eq!(capped.selected_value, 1_280);
+        assert_eq!(capped.available, 1_300);
+        assert_eq!(capped.outpoints.first(), Some(&synthetic_outpoint(0)));
+        assert_eq!(capped.outpoints.last(), Some(&synthetic_outpoint(127)));
+    }
+
+    #[test]
+    fn wallet_starts_empty_and_serializes_only_string_atom_values() {
+        let path = test_dir("wallet-empty");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+
+        let snapshot = node.wallet_snapshot().unwrap();
+        assert_eq!(snapshot.accepted_height, 0);
+        assert_eq!(snapshot.next_height, 1);
+        assert_eq!(snapshot.balances.spendable_atoms, "0");
+        assert_eq!(snapshot.balances.immature_atoms, "0");
+        assert_eq!(snapshot.balances.pending_atoms, "0");
+        assert_eq!(snapshot.spendable_utxo_count, 0);
+        assert_eq!(snapshot.immature_utxo_count, 0);
+        assert_eq!(snapshot.reserved_utxo_count, 0);
+        assert!(snapshot.history.is_empty());
+        assert_eq!(
+            snapshot.destination,
+            hex::encode(default_miner_destination())
+        );
+
+        let response = route_rpc_request(
+            RpcRequest {
+                method: "GET".to_owned(),
+                target: "/v1/wallet".to_owned(),
+                content_type: None,
+                body: Vec::new(),
+            },
+            &mut node,
+        );
+        assert_eq!(response.status, 200);
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        for field in ["spendable_atoms", "immature_atoms", "pending_atoms"] {
+            assert!(value["balances"][field].is_string());
+        }
+        let serialized = String::from_utf8(response.body).unwrap();
+        assert!(serialized.contains("INSECURE DEVNET-0 DEMO WALLET"));
+        assert!(!serialized.contains(&hex::encode([0x13; 32])));
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_coinbase_is_immature_until_next_height_101() {
+        let path = test_dir("wallet-maturity");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let first = mine_default_chain_to(&mut node, 1).remove(0);
+        let first_reward = first.coinbase.outputs[0].value;
+
+        let early = node.wallet_snapshot().unwrap();
+        assert_eq!(early.next_height, 2);
+        assert_eq!(early.balances.spendable_atoms, "0");
+        assert_eq!(early.balances.immature_atoms, first_reward.to_string());
+        assert_eq!(early.immature_utxo_count, 1);
+        assert_eq!(early.history[0].status, "immature");
+
+        mine_default_chain_to(&mut node, 99);
+        let through_100 = node.wallet_snapshot().unwrap();
+        assert_eq!(through_100.next_height, 100);
+        assert_eq!(through_100.balances.spendable_atoms, "0");
+        assert_eq!(through_100.immature_utxo_count, 99);
+
+        mine_default_chain_to(&mut node, 100);
+        let mature = node.wallet_snapshot().unwrap();
+        assert_eq!(mature.next_height, 101);
+        assert_eq!(mature.balances.spendable_atoms, first_reward.to_string());
+        assert_eq!(mature.spendable_utxo_count, 1);
+        assert_eq!(mature.immature_utxo_count, 99);
+        assert_eq!(mature.history.len(), MAX_WALLET_HISTORY);
+        assert_eq!(mature.history[0].height, Some(100));
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_send_reserves_burns_confirms_and_reconstructs_after_restart() {
+        let path = test_dir("wallet-send-restart");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let first = mine_default_chain_to(&mut node, 100).remove(0);
+        let input_atoms = first.coinbase.outputs[0].value;
+        let recipient = insecure_dev_destination(0x79);
+        let amount = COIN;
+        let fee = 1_u64;
+
+        let response = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/send",
+                json!({
+                    "recipient": hex::encode(recipient),
+                    "amount": "1.00000000",
+                    "fee": "0.00000001",
+                }),
+            ),
+            &mut node,
+        );
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body["amount_atoms"].is_string());
+        assert!(body["fee_burned_atoms"].is_string());
+        assert!(body["change_atoms"].is_string());
+        assert_eq!(body["amount_atoms"], amount.to_string());
+        assert_eq!(body["fee_burned_atoms"], fee.to_string());
+        assert_eq!(
+            body["change_atoms"],
+            (input_atoms - amount - fee).to_string()
+        );
+        let entry = node.mempool.values().next().unwrap();
+        assert_eq!(body["txid"], hex::encode(entry.txid));
+        assert_eq!(entry.transaction.txid(), entry.txid);
+        assert_eq!(entry.fee_burned, fee);
+
+        let pending = node.wallet_snapshot().unwrap();
+        assert_eq!(pending.spendable_utxo_count, 0);
+        assert_eq!(pending.reserved_utxo_count, 1);
+        assert_eq!(pending.balances.spendable_atoms, "0");
+        assert_eq!(
+            pending.balances.pending_atoms,
+            (input_atoms - amount - fee).to_string()
+        );
+        assert_eq!(pending.history[0].kind, "sent");
+        assert_eq!(pending.history[0].status, "pending");
+        assert_eq!(
+            pending.history[0].net_amount_atoms,
+            format!("-{}", amount + fee)
+        );
+        assert_eq!(pending.history[0].fee_burned_atoms, fee.to_string());
+        assert_eq!(
+            pending.history[0].counterparty,
+            Some(hex::encode(recipient))
+        );
+
+        let confirmed_block = node
+            .mine_once(
+                default_miner_destination(),
+                DEVNET_GENESIS_TIMESTAMP + 101 * 60,
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        assert_eq!(confirmed_block.transactions.len(), 1);
+        assert_eq!(
+            hex::encode(confirmed_block.transactions[0].txid()),
+            body["txid"]
+        );
+        assert!(node.mempool.is_empty());
+        let confirmed = node.wallet_snapshot().unwrap();
+        let tx_history = confirmed
+            .history
+            .iter()
+            .find(|item| item.txid == body["txid"])
+            .unwrap();
+        assert_eq!(tx_history.status, "confirmed");
+        assert_eq!(tx_history.height, Some(101));
+        assert_eq!(tx_history.fee_burned_atoms, "1");
+        drop(node);
+
+        let replayed = Node::open(&path).unwrap();
+        assert_eq!(replayed.wallet_snapshot().unwrap(), confirmed);
+        drop(replayed);
+        for entry in fs::read_dir(&path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(!bytes.windows(32).any(|window| window == [0x13; 32]));
+            }
+        }
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_send_rejects_invalid_requests_without_mempool_mutation() {
+        let path = test_dir("wallet-send-invalid");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let recipient = hex::encode(insecure_dev_destination(0x71));
+
+        for (value, expected_status) in [
+            (
+                json!({"recipient": "00", "amount": "1", "fee": "0.00000001"}),
+                400,
+            ),
+            (
+                json!({"recipient": recipient, "amount": "0", "fee": "0.00000001"}),
+                400,
+            ),
+            (
+                json!({"recipient": recipient, "amount": "1.000000001", "fee": "0.00000001"}),
+                400,
+            ),
+            (
+                json!({"recipient": recipient, "amount": "184467440737.09551616", "fee": "0.00000001"}),
+                400,
+            ),
+            (
+                json!({"recipient": recipient, "amount": "1", "fee": "0.00000001", "extra": true}),
+                400,
+            ),
+            (
+                json!({"recipient": recipient, "amount": "1", "fee": "0.00000001"}),
+                422,
+            ),
+        ] {
+            let response = route_rpc_request(wallet_post("/v1/wallet/send", value), &mut node);
+            assert_eq!(response.status, expected_status);
+            assert!(node.mempool.is_empty());
+        }
+
+        mine_default_chain_to(&mut node, 1);
+        let immature = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/send",
+                json!({"recipient": recipient, "amount": "1", "fee": "0.00000001"}),
+            ),
+            &mut node,
+        );
+        assert_eq!(immature.status, 422);
+        assert!(
+            String::from_utf8(immature.body)
+                .unwrap()
+                .contains("immature")
+        );
+
+        let insufficient = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/send",
+                json!({"recipient": recipient, "amount": "1000", "fee": "0.00000001"}),
+            ),
+            &mut node,
+        );
+        assert_eq!(insufficient.status, 422);
+        assert!(
+            String::from_utf8(insufficient.body)
+                .unwrap()
+                .contains("insufficient")
+        );
+
+        mine_default_chain_to(&mut node, 100);
+        let too_low = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/send",
+                json!({"recipient": recipient, "amount": "1", "fee": "0"}),
+            ),
+            &mut node,
+        );
+        assert_eq!(too_low.status, 422);
+        assert!(
+            String::from_utf8(too_low.body)
+                .unwrap()
+                .contains("relay minimum")
+        );
+        assert!(node.mempool.is_empty());
+
+        let wrong_type = route_rpc_request(
+            RpcRequest {
+                method: "POST".to_owned(),
+                target: "/v1/wallet/send".to_owned(),
+                content_type: Some("text/plain".to_owned()),
+                body: b"{}".to_vec(),
+            },
+            &mut node,
+        );
+        assert_eq!(wrong_type.status, 415);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_history_marks_external_payments_received_and_then_confirmed() {
+        let path = test_dir("wallet-received");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let funding = mine_default_chain_to(&mut node, 1).remove(0);
+        let received = spend_coinbase_output(&node, &funding, 1, 0x11, 0x13, 10);
+        let received_txid = received.txid();
+        let received_atoms = received.outputs[0].value;
+        node.submit_transaction(received).unwrap();
+
+        let pending = node.wallet_snapshot().unwrap();
+        let item = pending
+            .history
+            .iter()
+            .find(|item| item.txid == hex::encode(received_txid))
+            .unwrap();
+        assert_eq!(item.kind, "received");
+        assert_eq!(item.status, "pending");
+        assert_eq!(item.net_amount_atoms, received_atoms.to_string());
+        assert_eq!(item.fee_burned_atoms, "10");
+        assert_eq!(
+            item.counterparty,
+            Some(hex::encode(insecure_dev_destination(0x11)))
+        );
+
+        node.mine_once(
+            default_miner_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 120,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        let confirmed = node.wallet_snapshot().unwrap();
+        let item = confirmed
+            .history
+            .iter()
+            .find(|item| item.txid == hex::encode(received_txid))
+            .unwrap();
+        assert_eq!(item.kind, "received");
+        assert_eq!(item.status, "confirmed");
+        assert_eq!(item.height, Some(2));
+        assert_eq!(item.confirmations, 1);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_snapshot_tracks_the_active_branch_after_reorg() {
+        let path = test_dir("wallet-reorg");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let active = mine_default_chain_to(&mut node, 1).remove(0);
+        assert_eq!(
+            node.wallet_snapshot().unwrap().balances.immature_atoms,
+            active.coinbase.outputs[0].value.to_string()
+        );
+
+        let sibling = mined_child(
+            &node,
+            DEVNET_GENESIS_HASH,
+            DEVNET_GENESIS_TIMESTAMP + 61,
+            0x51,
+        );
+        node.submit_block(sibling.clone(), DEVNET_GENESIS_TIMESTAMP + 61)
+            .unwrap();
+        assert_eq!(node.state.tip(), active.block_id());
+        assert_ne!(node.state.tip(), sibling.block_id());
+        let sibling_child = mined_child(
+            &node,
+            sibling.block_id(),
+            DEVNET_GENESIS_TIMESTAMP + 121,
+            0x52,
+        );
+        node.submit_block(sibling_child.clone(), DEVNET_GENESIS_TIMESTAMP + 121)
+            .unwrap();
+        assert_eq!(node.state.tip(), sibling_child.block_id());
+
+        let reorged = node.wallet_snapshot().unwrap();
+        assert_eq!(reorged.accepted_height, 2);
+        assert_eq!(reorged.balances.spendable_atoms, "0");
+        assert_eq!(reorged.balances.immature_atoms, "0");
+        assert_eq!(reorged.balances.pending_atoms, "0");
+        assert!(reorged.history.is_empty());
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn wallet_consolidation_uses_at_most_128_smallest_unreserved_mature_outputs() {
+        let path = test_dir("wallet-consolidate");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        let first = mine_default_chain_to(&mut node, 100).remove(0);
+        let first_outpoint = OutPoint {
+            txid: first.coinbase_outpoint_id(),
+            index: 0,
+        };
+        let first_value = first.coinbase.outputs[0].value;
+        let split_fee = 1_000_u64;
+        let split_total = first_value - split_fee;
+        let per_output = split_total / MAX_TRANSACTION_INPUTS as u64;
+        let remainder = split_total % MAX_TRANSACTION_INPUTS as u64;
+        let mut split = Transaction {
+            network_id: node.params.network_id,
+            version: TRANSACTION_VERSION,
+            inputs: vec![TxInput {
+                previous: first_outpoint,
+                witness: InputWitness::Key {
+                    public_key: [0; 32],
+                    signature: Vec::new(),
+                },
+            }],
+            outputs: (0..MAX_TRANSACTION_INPUTS)
+                .map(|index| TxOutput {
+                    value: per_output + u64::from(index == 0) * remainder,
+                    lock: OutputLock::Key(default_miner_destination()),
+                    spendable_height: node.state.next_height(),
+                })
+                .collect(),
+        };
+        let key = insecure_dev_wallet_signing_key();
+        split.sign_all(&[&key]).unwrap();
+        node.submit_transaction(split).unwrap();
+        node.mine_once(
+            default_miner_destination(),
+            DEVNET_GENESIS_TIMESTAMP + 101 * 60,
+            DEFAULT_MINING_ATTEMPTS,
+        )
+        .unwrap();
+        let before = node.wallet_snapshot().unwrap();
+        assert_eq!(before.spendable_utxo_count, MAX_TRANSACTION_INPUTS + 1);
+        assert!(before.immature_utxo_count > 0);
+        assert_eq!(before.reserved_utxo_count, 0);
+
+        assert!(matches!(
+            node.consolidate_dev_wallet(1_000, 1),
+            Err(NodeError::InvalidConsolidationMaxInputs)
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet(1_000, MAX_TRANSACTION_INPUTS + 1),
+            Err(NodeError::InvalidConsolidationMaxInputs)
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet(0, MAX_TRANSACTION_INPUTS),
+            Err(NodeError::MempoolFeeTooLow { .. })
+        ));
+        assert!(node.mempool.is_empty());
+
+        let invalid_max = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/consolidate",
+                json!({"fee": "0.00001000", "max_inputs": 1}),
+            ),
+            &mut node,
+        );
+        assert_eq!(invalid_max.status, 400);
+        let response = route_rpc_request(
+            wallet_post(
+                "/v1/wallet/consolidate",
+                json!({"fee": "0.00001000", "max_inputs": MAX_TRANSACTION_INPUTS}),
+            ),
+            &mut node,
+        );
+        assert_eq!(response.status, 200);
+        let response_body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response_body["inputs_consolidated"], MAX_TRANSACTION_INPUTS);
+        assert_eq!(response_body["fee_burned_atoms"], "1000");
+        for field in ["input_atoms", "output_atoms", "fee_burned_atoms"] {
+            assert!(response_body[field].is_string());
+        }
+        let entry = node.mempool.values().next().unwrap();
+        assert_eq!(response_body["txid"], hex::encode(entry.txid));
+        assert_eq!(entry.transaction.inputs.len(), MAX_TRANSACTION_INPUTS);
+        assert_eq!(entry.transaction.outputs.len(), 1);
+        assert_eq!(
+            entry.transaction.outputs[0].lock,
+            OutputLock::Key(default_miner_destination())
+        );
+        let input_atoms = response_body["input_atoms"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let output_atoms = response_body["output_atoms"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(input_atoms, split_total);
+        assert_eq!(input_atoms, output_atoms + 1_000);
+        assert_eq!(entry.transaction.outputs[0].value, output_atoms);
+
+        let reserved = node.wallet_snapshot().unwrap();
+        assert_eq!(reserved.reserved_utxo_count, MAX_TRANSACTION_INPUTS);
+        assert_eq!(reserved.spendable_utxo_count, 1);
+        assert_eq!(reserved.balances.pending_atoms, output_atoms.to_string());
+        assert!(matches!(
+            node.consolidate_dev_wallet(1_000, MAX_TRANSACTION_INPUTS),
+            Err(NodeError::WalletNotEnoughUtxos(1))
+        ));
+        let serialized = String::from_utf8(response.body).unwrap();
+        assert!(!serialized.contains(&hex::encode([0x13; 32])));
+
         drop(node);
         clean_test_dir(&path);
     }

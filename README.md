@@ -83,9 +83,36 @@ block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
 
+### Local Devnet wallet
+
+Keep the node above running, then start the wallet in a second PowerShell
+window:
+
+```powershell
+Set-Location C:\Source\CommonFoundry\apps\wallet
+npm ci
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. The Vite development server listens only on
+loopback and proxies browser requests under `/rpc` to the node at
+`http://127.0.0.1:18443`; the node RPC is not exposed directly to the browser
+or public network.
+
+The wallet reads real active-chain balances and history, displays the receive
+destination, creates signed sends, mines development blocks, and consolidates
+mining outputs through the local node. Mined rewards require 100 confirmations
+before they are spendable. Consolidation selects mature, unreserved outputs in
+smallest-first order, accepts 2 through 128 inputs, creates one wallet output,
+and burns the chosen transaction fee.
+
+The signing key is a fixed, source-visible key shared by every Devnet checkout.
+The interface and funds are for private, valueless Devnet-0 testing only. It is
+not production custody software and must never receive real value.
+
 This is not a public testnet. It has no peer discovery, peer identity
-authentication, transport encryption, NAT traversal, wallet/key custody,
-production miner protocol, or optimized miner. Extending a side branch
+authentication, transport encryption, NAT traversal, production wallet/key
+custody, production miner protocol, or optimized miner. Extending a side branch
 currently replays it from genesis, which is intentionally Devnet-only and does
 not scale. See [docs/devnet-0.md](docs/devnet-0.md) for exact two- and
 three-node commands, RPC examples, acceptance checks, and operating limits.

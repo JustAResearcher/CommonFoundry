@@ -52,7 +52,14 @@ discovery, NAT traversal, reputation/ban system, or demonstrated DDoS
 resilience. Extending a side branch currently reconstructs that branch from
 genesis, which is deliberately Devnet-only and not scalable. The mempool is
 volatile and intentionally excludes unconfirmed-parent packages. There is no
-wallet/key custody, production miner protocol, or optimized miner.
+production wallet/key custody, production miner protocol, or optimized miner.
+
+The local Devnet GUI and wallet RPC use one fixed, source-visible signing key
+shared by every checkout. They can display active-chain balances and history,
+sign sends, mine development blocks, and consolidate mature unreserved outputs,
+but they provide no key generation, encrypted storage, backup, or recovery.
+They are private Devnet test tools for valueless funds, not a production wallet.
+Never use the shared destination for real value.
 
 A completed, sound proof can establish the committed function, not physical GPU
 use or VRAM residency. No such hardware claim may be used to weaken the

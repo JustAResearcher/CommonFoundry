@@ -85,6 +85,38 @@ directory:
 Only one process may open a data directory. While `run` owns it, use RPC rather
 than the offline `status` or `mine-once` commands.
 
+## Run the local wallet
+
+Leave the node running on its default RPC address, then open a second
+PowerShell window:
+
+```powershell
+Set-Location C:\Source\CommonFoundry\apps\wallet
+npm ci
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. Vite listens on loopback and maps the wallet's
+`/rpc` requests to `http://127.0.0.1:18443`, removing the `/rpc` prefix. This
+keeps the node loopback-only and does not add permissive browser CORS headers.
+
+The GUI uses the node's active chain and mempool rather than sample data. It
+shows balances and transaction history, displays and copies the receive
+destination, signs and submits sends, and can mine a development block.
+Transaction fees are burned. Mined rewards remain immature for 100
+confirmations and cannot be spent or consolidated before then.
+
+For miner wallet hygiene, **Transactions -> Consolidate mining outputs**
+combines eligible outputs into one self-owned output. The node deterministically
+selects mature, unreserved outputs smallest-first, with a requested maximum of
+2 through 128 inputs. The selected fee is burned, and unconfirmed transactions
+reserve their inputs; mine the current consolidation before submitting the next
+batch.
+
+The wallet signs only with the fixed, source-visible Devnet demonstration key.
+Every checkout has the same key. This is a private, valueless test interface,
+not production key custody; never send it real value.
+
 ## Run two or three local nodes
 
 Build once, then run each command in a separate PowerShell window. The fully
@@ -132,12 +164,18 @@ The first node above uses `http://127.0.0.1:18443`.
 | `GET` | `/health` | Storage health and Devnet identity |
 | `GET` | `/v1/status` | Fingerprint, active tip, cumulative work, target, UTXO count, and mempool totals |
 | `GET` | `/v1/mempool` | Ordered transaction IDs, encoded sizes, burned fees, and pool totals |
+| `GET` | `/v1/wallet` | Shared Devnet destination, active-chain balances, output counts, mempool state, and history |
 | `GET` | `/v1/template?miner=<64-hex-x-only-public-key>` | JSON template containing the current mempool transactions and exact burned fees |
+| `POST` | `/v1/wallet/send` | Sign and admit a shared-key Devnet send from JSON `recipient`, `amount`, and `fee` fields |
+| `POST` | `/v1/wallet/consolidate` | Consolidate mature, unreserved shared-key outputs from JSON `fee` and `max_inputs` fields |
 | `POST` | `/v1/transaction` | Admit one canonical raw transaction to the volatile mempool |
 | `POST` | `/v1/mine?miner=<64-hex-x-only-public-key>&attempts=<1..1000000>` | Build, mine, validate, persist, and apply one block; body must be empty |
 | `POST` | `/v1/block` | Validate, persist, and index one canonical raw block |
 
-Canonical transaction and block submissions require
+Wallet send and consolidation requests require the
+`Content-Type: application/json` header; CMFD amounts are decimal strings with
+at most eight decimal places. Canonical transaction and block submissions
+require
 `Content-Type: application/octet-stream`. Their body limits are 64 KiB and
 1 MiB respectively. Template JSON is descriptive; `/v1/block` accepts the
 canonical binary block frame, not that JSON.
@@ -170,9 +208,11 @@ Invoke-RestMethod -Method Post `
 ```
 
 The example miner destination is the source-visible, insecure Devnet key. It is
-appropriate only for this valueless local network. The repository does not yet
-provide wallet/key custody or a transaction-building CLI, so
-`transaction.cmfd` must already be a correctly signed canonical transaction.
+appropriate only for this valueless local network. The GUI and wallet RPC build
+and sign transactions with that same fixed key; they do not provide key
+generation, encrypted storage, backup, recovery, or production custody. A raw
+`transaction.cmfd` submitted directly to `/v1/transaction` must still already
+be a correctly signed canonical transaction.
 
 ## Multi-node acceptance checks
 
@@ -254,7 +294,9 @@ scalable public-network design.
 
 Devnet-0 has no public-peer discovery, peer identity authentication, transport
 encryption, NAT traversal, reputation/ban system, demonstrated DDoS maturity,
-wallet/key custody, production mining protocol, or optimized miner. Peer
+production wallet/key custody, production mining protocol, or optimized miner.
+Its local GUI signs with a fixed shared demonstration key, not a user-secured
+secret. Peer
 compatibility checks do not establish who operates the remote process, and
 peers never supply the local block-acceptance time. All network-facing use must
 remain on an isolated, valueless private network.

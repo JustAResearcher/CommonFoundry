@@ -358,6 +358,11 @@ impl UtxoSet {
         self.outputs.get(outpoint)
     }
 
+    /// Iterates the currently unspent outputs without exposing mutation.
+    pub fn iter(&self) -> impl Iterator<Item = (&OutPoint, &TxOutput)> {
+        self.outputs.iter()
+    }
+
     pub fn len(&self) -> usize {
         self.outputs.len()
     }

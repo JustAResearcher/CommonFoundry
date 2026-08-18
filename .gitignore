@@ -1,5 +1,7 @@
 /target/
 /commonfoundry-devnet0/
+/apps/wallet/node_modules/
+/apps/wallet/dist/
 *.profraw
 *.profdata
 .idea/
