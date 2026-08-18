@@ -3,6 +3,11 @@
 CommonFoundry (CMFD) is a research-first cryptocurrency implementation built
 around ForgeMatrix, a block-bound dense matrix proof of work.
 
+The [technical white paper](docs/whitepaper.md) explains the motivation,
+consensus architecture, monetary policy, ForgeMatrix v2 relation, proposed
+succinct proof system, inference-market protocol, threat model, and activation
+requirements in detail.
+
 This repository contains the consensus oracle, a seedless v2 model format, the
 exact small-profile v2 arithmetic relation, a test-size matrix sumcheck
 transcript, Rust/CUDA arithmetic smoke vectors, monetary policy, signed UTXO
