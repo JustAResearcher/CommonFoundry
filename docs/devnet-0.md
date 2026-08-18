@@ -87,24 +87,42 @@ than the offline `status` or `mine-once` commands.
 
 ## Run the local wallet
 
-Leave the node running on its default RPC address, then open a second
-PowerShell window:
+The native wallet owns an embedded Devnet node, its data-directory lock, and
+the default P2P listener. Stop any separate node using `127.0.0.1:18444`, then
+run:
 
 ```powershell
 Set-Location C:\Source\CommonFoundry\apps\wallet
 npm ci
-npm run dev
+npm run desktop:dev
 ```
 
-Open <http://127.0.0.1:5173>. Vite listens on loopback and maps the wallet's
-`/rpc` requests to `http://127.0.0.1:18443`, removing the `/rpc` prefix. This
-keeps the node loopback-only and does not add permissive browser CORS headers.
+The native window calls a bounded Tauri IPC allowlist. It does not start the
+HTTP RPC listener on `18443`. Its chain data is kept in the operating system's
+application-data directory under `org.commonfoundry.wallet.devnet/devnet-0`,
+rather than the command-line node's working-directory default.
+
+For browser development, leave a command-line node running on its default RPC
+address and use `npm run dev` instead. Open <http://127.0.0.1:5173>. Vite maps
+the wallet's `/rpc` requests to `http://127.0.0.1:18443`, removing the `/rpc`
+prefix. This keeps the node loopback-only and does not add permissive browser
+CORS headers.
 
 The GUI uses the node's active chain and mempool rather than sample data. It
 shows balances and transaction history, displays and copies the receive
-destination, signs and submits sends, and can mine a development block.
-Transaction fees are burned. Mined rewards remain immature for 100
-confirmations and cannot be spent or consolidated before then.
+destination, signs and submits sends, and can run a continuous, cancellable
+solo miner against the tiny CPU reference profile. Its reported rate is exact
+ForgeMatrix matrix evaluations per second. It is not an optimized GPU rate,
+and the software does not prove physical GPU or VRAM use. Transaction fees are
+burned. Mined rewards remain immature for 100 confirmations and cannot be
+spent or consolidated before then.
+
+The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the
+exact form `cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX` and a worker name matching
+`[A-Za-z0-9._-]{1,32}`. The endpoint must be a numeric loopback, RFC1918 IPv4,
+or IPv6 unique-local address; DNS names and public addresses are rejected.
+This is a CMFD-specific TLS 1.3 protocol, not Bitcoin Stratum. Its counters are
+only volatile Devnet telemetry, not spendable pool earnings.
 
 For miner wallet hygiene, **Transactions -> Consolidate mining outputs**
 combines eligible outputs into one self-owned output. The node deterministically
@@ -116,6 +134,118 @@ batch.
 The wallet signs only with the fixed, source-visible Devnet demonstration key.
 Every checkout has the same key. This is a private, valueless test interface,
 not production key custody; never send it real value.
+
+The packaged wallet can also connect its embedded node to static private P2P
+peers. See [../apps/wallet/src-tauri/README.md](../apps/wallet/src-tauri/README.md)
+for the exact Windows and Linux command-line options.
+
+## Run a local pool
+
+Build `cmfd-node` as above. From the repository root, create a fresh TLS
+certificate and private key. The command uses create-new semantics and refuses
+to overwrite either output:
+
+```powershell
+New-Item -ItemType Directory -Force .\devnet-0-linear5y\pool-tls | Out-Null
+
+$certificateInfo = .\target\debug\cmfd-node.exe pool-certificate `
+  --certificate .\devnet-0-linear5y\pool-tls\pool-cert.der `
+  --private-key .\devnet-0-linear5y\pool-tls\pool-key.der |
+  ConvertFrom-Json
+
+$certificateInfo
+$poolUrl = "cmfd+tls://127.0.0.1:18445?pin=$($certificateInfo.certificate_sha256)"
+$poolUrl
+```
+
+The certificate is public. Keep `pool-key.der` and the pool data directory
+restricted to the pool operator account, and give miners only the printed
+certificate SHA-256 pin, never the private key. On Unix the generator creates
+the private-key DER with mode `0600`; on Windows it relies on the containing
+directory's ACLs, so create or select a directory whose ACL grants access only
+to the operator. Start the pool in a second PowerShell window:
+
+```powershell
+Set-Location C:\Source\CommonFoundry
+
+.\target\debug\cmfd-node.exe `
+  --data-dir .\devnet-0-linear5y\pool `
+  pool-serve `
+  --bind 127.0.0.1:18445 `
+  --p2p-bind 127.0.0.1:18454 `
+  --peer 127.0.0.1:18444 `
+  --certificate .\devnet-0-linear5y\pool-tls\pool-cert.der `
+  --private-key .\devnet-0-linear5y\pool-tls\pool-key.der `
+  --share-leading-zero-bits 7
+```
+
+Paste the printed `$poolUrl` into **Mining -> Pool**, choose a worker name such
+as `rig-01`, and start mining. The default bind is `127.0.0.1:18445`; remote
+private-LAN testing requires an explicit private bind such as
+`192.168.50.20:18445`, and the URL must use that same reachable numeric IP.
+`--share-leading-zero-bits` may be 0 through 7 on Devnet-0 and defaults to 7;
+smaller values make test shares easier. If `--miner` is omitted, blocks pay the
+fixed, source-visible Devnet destination. A supplied `--miner` must be a
+64-character x-only Schnorr public key.
+
+`pool-serve` owns its selected data directory and starts the TLS pool plus a P2P
+inbound listener and optional static-peer poller on the same node; it does not
+start RPC. Its P2P default is `127.0.0.1:18444`, so the command above assigns
+`18454` to avoid colliding with the wallet and polls the wallet on `18444`.
+`--peer` is repeatable and uses the same private-address checks as `run`.
+For bidirectional block synchronization, launch the packaged wallet with
+`--peer 127.0.0.1:18454` as described in the desktop peer README linked above.
+Without the reciprocal wallet peer, pool shares and blocks still work on the
+pool node, but the wallet's embedded chain will not pull the pool's new blocks.
+
+### Pool protocol and accounting boundary
+
+The transport is TLS 1.3 with 4-byte big-endian length-prefixed, bounded JSON
+messages. The wallet authenticates the server by SHA-256 hashing the exact
+leaf-certificate DER bytes and comparing all 32 bytes with the URL pin. The
+certificate's handshake signature is still verified. There is no certificate
+authority lookup, client certificate, worker identity proof, or automatic pin
+distribution, so transfer and verify the pin through a separate trusted path.
+Worker and payout claims are not client-authenticated; session counters are
+therefore not identity-secure. TLS protects the pool socket only; Devnet P2P
+remains a separate unencrypted, unauthenticated protocol.
+
+The client hello commits to the pool protocol version, network ID, consensus
+fingerprint, worker label, and payout label. The server returns a session ID
+and a job containing an immutable `BlockChallenge`, a distinct easier share
+target, and a server-issued job ID. A share submission contains only that job
+ID and a nonce. It does not contain a trusted work digest or proof.
+
+For every submitted nonce, the server independently evaluates the exact
+committed ForgeMatrix relation and obtains its work digest without applying a
+target. It then compares the recomputed digest separately with the share target
+and with the chain target already committed inside `BlockChallenge`. The share
+target must be easier than or equal to the chain target and never replaces or
+mutates it. A share-only result cannot construct a block. If the digest also
+meets the original chain target, the server reconstructs the block and passes
+it through ordinary node submission and consensus validation.
+
+Stale jobs, duplicate nonces, low-difficulty shares, malformed or oversized
+frames, excess connections, and configured job/session/ledger limits are
+rejected. Frames are capped at 16 KiB, with at most 64 concurrent sessions,
+1,000,000 messages per session, 65,536 valid nonce records per job, 1,024 recent
+session records, and 1,024 recent payout-label records. Accepted shares
+increment an in-memory test counter; the default is one credited Devnet atom
+per accepted share. The bounded session and payout views reset when the pool
+process restarts. These values are valueless, nonwithdrawable counters, not
+funds or an on-chain balance. The client payout
+field is an untrusted grouping label and does not redirect the miner reward:
+valid pool blocks send that output to the server's `--miner` destination. There
+is no ownership proof, durable or reorganization-aware payout ledger,
+withdrawal transaction, or secure user-key custody. Because every current
+wallet checkout shares the same public demonstration key, the pool cannot
+securely distinguish owners.
+
+Before any production use, pool mining still needs unique user and pool keys,
+persistent auditable and reorganization-aware reward accounting, real on-chain
+payouts, optimized GPU mining and proof generation, share-proof and
+verification-queue denial-of-service controls, load/fuzz testing, independent
+implementations, and external audits.
 
 ## Run two or three local nodes
 
@@ -292,14 +422,15 @@ scalable public-network design.
 
 ## Current boundary
 
-Devnet-0 has no public-peer discovery, peer identity authentication, transport
-encryption, NAT traversal, reputation/ban system, demonstrated DDoS maturity,
-production wallet/key custody, production mining protocol, or optimized miner.
+Devnet-0 has no public-peer discovery, peer identity authentication, encrypted
+P2P transport, NAT traversal, reputation/ban system, demonstrated DDoS
+maturity, production wallet/key custody, durable pool payouts, or optimized
+GPU miner.
 Its local GUI signs with a fixed shared demonstration key, not a user-secured
-secret. Peer
-compatibility checks do not establish who operates the remote process, and
-peers never supply the local block-acceptance time. All network-facing use must
-remain on an isolated, valueless private network.
+secret. The pool's pinned TLS server transport does not change the P2P
+boundary: peer compatibility checks do not establish who operates the remote
+process, and peers never supply the local block-acceptance time. All
+network-facing use must remain on an isolated, valueless private network.
 
 The compact v2 proof is also still a full-recomputation reference path. A
 production succinct proof, raw-model commitment ceremony/link, independent

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Common Foundry Wallet",
+  "version": "0.1.0-devnet.2",
+  "identifier": "org.commonfoundry.wallet.devnet",
+  "mainBinaryName": "common-foundry-wallet",
+  "build": {
+    "beforeDevCommand": "npm run dev:desktop",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeBuildCommand": "npm run build:desktop",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "Common Foundry Wallet — Devnet-0",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 960,
+        "minHeight": 640,
+        "backgroundColor": "#f4f1ec",
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "devtools": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "devCsp": "default-src 'self' http://127.0.0.1:5173; connect-src ipc: http://ipc.localhost http://127.0.0.1:5173 ws://127.0.0.1:5173; img-src 'self' data: http://127.0.0.1:5173; script-src 'self' http://127.0.0.1:5173; style-src 'self' 'unsafe-inline' http://127.0.0.1:5173; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'none'",
+      "freezePrototype": true,
+      "assetProtocol": {
+        "enable": false,
+        "scope": []
+      },
+      "capabilities": ["main-wallet"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "category": "Finance",
+    "shortDescription": "Common Foundry Devnet-0 desktop wallet",
+    "longDescription": "Native desktop wallet and embedded node for the private, valueless Common Foundry Devnet-0.",
+    "copyright": "Copyright © 2026 Common Foundry contributors",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

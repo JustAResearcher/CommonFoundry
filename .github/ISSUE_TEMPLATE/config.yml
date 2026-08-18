@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/JustAResearcher/CommonFoundry/security/advisories/new
+    about: Report vulnerabilities privately; do not publish working exploits or secrets.
+  - name: Devnet operator guide
+    url: https://github.com/JustAResearcher/CommonFoundry/blob/main/docs/devnet-0.md
+    about: Read the current setup, networking, mining, pool, and safety instructions.

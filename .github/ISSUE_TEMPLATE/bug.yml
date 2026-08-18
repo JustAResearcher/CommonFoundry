@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible Common Foundry Devnet problem.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Common Foundry Devnet software is experimental and valueless. Remove private keys, credentials, wallet backups, public IP addresses, and unrelated personal information from every attachment.
+  - type: input
+    id: version
+    attributes:
+      label: Version and checksum
+      description: Give the release tag and SHA-256 of the downloaded artifact.
+      placeholder: v0.1.0-devnet.2 / sha256...
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Windows wallet
+        - Linux wallet
+        - Headless node
+        - Solo mining
+        - Pool mining
+        - Peer synchronization
+        - Transactions or UTXO consolidation
+        - Build or documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS/version, CPU, GPU, RAM, installation format, and node topology when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. Start ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Redact credentials, keys, private addresses, and personal paths. Drag files here if helpful.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I reproduced this with valueless Devnet data and removed secrets and personal information.
+          required: true
+        - label: This is not a vulnerability requiring private disclosure.
+          required: true

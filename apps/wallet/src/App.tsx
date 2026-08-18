@@ -1,7 +1,9 @@
 import { AlertTriangle, RefreshCw, Settings2, X } from "lucide-react";
 import { useCallback, useState } from "react";
+import { usesEmbeddedNode } from "./api/nodeClient";
 import { ConsolidationDialog } from "./components/ConsolidationDialog";
 import { MobileNav } from "./components/MobileNav";
+import { MiningView } from "./components/MiningView";
 import { NetworkView } from "./components/NetworkView";
 import { Overview } from "./components/Overview";
 import { ReceiveDialog } from "./components/ReceiveDialog";
@@ -13,6 +15,7 @@ import { useWalletData } from "./hooks/useWalletData";
 const TITLES: Record<ViewName, { eyebrow: string; title: string }> = {
   overview: { eyebrow: "Common Foundry Wallet", title: "Overview" },
   transactions: { eyebrow: "Wallet ledger", title: "Transactions" },
+  mining: { eyebrow: "ForgeMatrix reference engine", title: "Mining" },
   network: { eyebrow: "Devnet operations", title: "Network" },
 };
 
@@ -101,6 +104,9 @@ export function App() {
               onConsolidate={openConsolidation}
             />
           ) : null}
+          {view === "mining" ? (
+            <MiningView wallet={data.wallet} nodeStatus={data.status} />
+          ) : null}
           {view === "network" ? (
             <NetworkView
               status={data.status}
@@ -114,7 +120,11 @@ export function App() {
         </div>
 
         <footer className="statusbar">
-          <span><i className={data.error ? "offline" : ""} />{data.error ? "RPC offline" : "RPC connected"}</span>
+          <span><i className={data.error ? "offline" : ""} />{
+            data.error
+              ? (usesEmbeddedNode ? "Embedded node offline" : "RPC offline")
+              : (usesEmbeddedNode ? "Embedded node connected" : "RPC connected")
+          }</span>
           <span>CommonFoundry Devnet-0</span>
           <span>Height {data.status?.accepted_height ?? "—"}</span>
           <span>{data.status?.storage_healthy ? "Storage healthy" : "Storage unavailable"}</span>

@@ -1,6 +1,6 @@
 [package]
 name = "cmfd-node"
-version = "0.1.0-devnet.1"
+version = "0.1.0-devnet.2"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,18 @@ blake3.workspace = true
 clap.workspace = true
 cmfd-consensus = { path = "../cmfd-consensus" }
 fs2.workspace = true
+getrandom = "0.3"
 hex.workspace = true
 k256.workspace = true
 primitive-types.workspace = true
+rcgen = "=0.14.5"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
 thiserror.workspace = true
+# Keep the certificate stack on the versions exercised by this Devnet release.
+time = { version = "=0.3.45", default-features = false }
 
 [lib]
 name = "cmfd_node"

@@ -19,6 +19,7 @@ used nor that the model was physically resident in GPU VRAM.
 | Layers, `L` | 384, organized as 3 banks of 128 |
 | Weight encoding | one raw byte in `0..=250`, decoded as `byte - 125` |
 | Activation encoding | one raw field representative in `0..=250`, decoded as `value - 125` |
+| Dominant arithmetic | signed INT8 x INT8 GEMM with exact INT32 accumulation |
 | Transition modulus, `P` | 134,217,689 (prime) |
 | Output alphabet modulus | 251 |
 | Proof base field | Goldilocks, `p = 2^64 - 2^32 + 1` |

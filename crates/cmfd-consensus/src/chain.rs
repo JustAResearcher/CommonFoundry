@@ -730,12 +730,11 @@ impl<'a> UtxoOverlay<'a> {
             OutputLock::InferenceChannel { channel_id } => Some(*channel_id),
             OutputLock::Key(_) => None,
         };
-        if let Some(channel_id) = channel_id {
-            if self.contains_active_channel(&channel_id)
-                || self.contains_retired_channel(&channel_id)
-            {
-                return Err(ChainError::DuplicateChannel);
-            }
+        if let Some(channel_id) = channel_id
+            && (self.contains_active_channel(&channel_id)
+                || self.contains_retired_channel(&channel_id))
+        {
+            return Err(ChainError::DuplicateChannel);
         }
         if self.get(&outpoint).is_some() {
             return Err(ChainError::TxidCollision);

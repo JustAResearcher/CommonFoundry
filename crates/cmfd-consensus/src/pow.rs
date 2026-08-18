@@ -104,6 +104,15 @@ impl BlockProof {
         }
     }
 
+    /// Returns the committed work digest by value so callers cannot mutate a
+    /// proof through the accessor.
+    pub fn work_digest(&self) -> [u8; 32] {
+        match self {
+            Self::V1Legacy(proof) => proof.work_digest,
+            Self::V2Reference(proof) => proof.work_digest,
+        }
+    }
+
     pub(crate) fn absorb(&self, hasher: &mut Hasher) {
         hasher.update(&self.proof_type().to_le_bytes());
         match self {
@@ -152,6 +161,39 @@ impl ConsensusPowVerifier {
             }
             (Self::V2Reference(reference), BlockProof::V2Reference(proof)) => {
                 reference.verify_compact(block, proof)?;
+                Ok(())
+            }
+            _ => Err(PowError::WrongProofType),
+        }
+    }
+
+    /// Deterministically evaluates the configured proof relation for one
+    /// nonce. This deliberately does not apply `block.target`; it is suitable
+    /// for recomputing pool shares, not for accepting blocks.
+    pub fn evaluate(&self, block: &BlockChallenge, nonce: u64) -> Result<BlockProof, PowError> {
+        match self {
+            Self::V1Legacy(verifier) => Ok(BlockProof::V1Legacy(verifier.prove(block, nonce))),
+            Self::V2Reference(reference) => Ok(BlockProof::V2Reference(
+                reference.prove_compact(block, nonce)?,
+            )),
+        }
+    }
+
+    /// Recomputes and verifies the configured committed proof relation while
+    /// intentionally leaving target enforcement to the caller. Consensus
+    /// block validation must continue to call [`Self::verify`].
+    pub fn verify_evaluation(
+        &self,
+        block: &BlockChallenge,
+        proof: &BlockProof,
+    ) -> Result<(), PowError> {
+        match (self, proof) {
+            (Self::V1Legacy(verifier), BlockProof::V1Legacy(proof)) => {
+                verifier.verify_relation(block, proof)?;
+                Ok(())
+            }
+            (Self::V2Reference(reference), BlockProof::V2Reference(proof)) => {
+                reference.verify_compact_relation(block, proof)?;
                 Ok(())
             }
             _ => Err(PowError::WrongProofType),

@@ -12,11 +12,12 @@ use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY, EconomicsError,
-    FixedRewardDestinations, InputWitness, MAX_BLOCK_BYTES, MAX_FUTURE_OFFSET_SECS,
-    MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS, NETWORK_PROTOCOL_VERSION, NetworkError,
-    NetworkParams, OutPoint, OutputLock, PowError, PowParameters, TRANSACTION_VERSION, Transaction,
-    TxInput, TxOutput, WireError, add_chain_work, chain_work_bytes, decode_block,
-    decode_transaction, encode_block, encode_transaction, merkle_root, v2_test_reference,
+    FixedRewardDestinations, ForgeMatrixError, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
+    MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
+    NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
+    PowParameters, TRANSACTION_VERSION, Transaction, TxInput, TxOutput, WireError, add_chain_work,
+    chain_work_bytes, decode_block, decode_transaction, encode_block, encode_transaction,
+    merkle_root, v2_test_reference,
 };
 use fs2::FileExt;
 use k256::schnorr::{SigningKey, VerifyingKey};
@@ -27,6 +28,7 @@ use thiserror::Error;
 
 pub mod p2p;
 pub mod peer;
+pub mod pool;
 
 pub const DEVNET_NETWORK_ID: [u8; 32] = [0x63; 32];
 pub const DEVNET_GENESIS_HASH: [u8; 32] = [0x47; 32];
@@ -35,6 +37,8 @@ pub const DEFAULT_RPC_ADDRESS: &str = "127.0.0.1:18443";
 pub const DEFAULT_P2P_ADDRESS: &str = "127.0.0.1:18444";
 pub const DEFAULT_DATA_DIR: &str = "commonfoundry-devnet0";
 pub const DEFAULT_MINING_ATTEMPTS: u64 = 1_000_000;
+/// Maximum work accepted by one cancellable immutable mining-job search.
+pub const MAX_MINING_SEARCH_ATTEMPTS: u64 = DEFAULT_MINING_ATTEMPTS;
 pub const MAX_MEMPOOL_TRANSACTIONS: usize = 1_024;
 pub const MAX_MEMPOOL_BYTES: usize = 512 * 1024;
 pub const MIN_RELAY_FEE_PER_KIB: u64 = 1;
@@ -83,6 +87,10 @@ pub enum NodeError {
     TemplateTimeUnavailable,
     #[error("miner destination must be a 64-character hex Schnorr public key")]
     InvalidMinerDestination,
+    #[error("mining search attempts must be between 1 and {MAX_MINING_SEARCH_ATTEMPTS}")]
+    InvalidMiningSearchAttempts,
+    #[error("mining share target must be easier than or equal to the immutable block target")]
+    InvalidMiningShareTarget,
     #[error("RPC bind address must be loopback, received {0}")]
     NonLoopbackRpc(SocketAddr),
     #[error(
@@ -149,6 +157,78 @@ pub enum NodeError {
     Economics(#[from] EconomicsError),
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct NodeClientError {
+    pub code: &'static str,
+    pub status: u16,
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl NodeError {
+    pub fn client_error(&self) -> NodeClientError {
+        let (code, status, retryable) = match self {
+            Self::DataDirLocked(_) => ("data_dir_locked", 409, false),
+            Self::Io { .. } => ("storage_io", 500, false),
+            Self::InvalidMetadata => ("invalid_metadata", 500, false),
+            Self::MissingMetadata => ("missing_metadata", 500, false),
+            Self::FingerprintMismatch => ("fingerprint_mismatch", 409, false),
+            Self::CorruptLog(_) => ("corrupt_block_log", 500, false),
+            Self::InvalidSystemTime => ("invalid_system_time", 500, false),
+            Self::TemplateTimeUnavailable => ("template_time_unavailable", 503, true),
+            Self::InvalidMinerDestination => ("invalid_miner_destination", 400, false),
+            Self::InvalidMiningSearchAttempts => ("invalid_mining_search_attempts", 400, false),
+            Self::InvalidMiningShareTarget => ("invalid_mining_share_target", 400, false),
+            Self::NonLoopbackRpc(_) => ("non_loopback_rpc", 400, false),
+            Self::StorageFaulted => ("storage_faulted", 503, false),
+            Self::DuplicateBlock(_) => ("duplicate_block", 409, false),
+            Self::UnknownParent(_) => ("unknown_parent", 422, true),
+            Self::DuplicateMempoolTransaction(_) => ("duplicate_mempool_transaction", 409, false),
+            Self::MempoolInputConflict(_) => ("mempool_input_conflict", 409, false),
+            Self::MempoolUnconfirmedInput(_) => ("mempool_unconfirmed_input", 422, true),
+            Self::MempoolTransactionLimit => ("mempool_transaction_limit", 422, true),
+            Self::MempoolByteLimit => ("mempool_byte_limit", 422, true),
+            Self::MempoolFeeTooLow { .. } => ("mempool_fee_too_low", 422, false),
+            Self::InvalidWalletRecipient => ("invalid_wallet_recipient", 400, false),
+            Self::InvalidWalletAmount => ("invalid_wallet_amount", 400, false),
+            Self::WalletAmountOverflow => ("wallet_amount_overflow", 400, false),
+            Self::WalletZeroAmount => ("wallet_zero_amount", 400, false),
+            Self::WalletFundsImmature { .. } => ("wallet_funds_immature", 422, true),
+            Self::WalletInsufficientFunds { .. } => ("wallet_insufficient_funds", 422, false),
+            Self::WalletInputLimit { .. } => ("wallet_input_limit", 422, false),
+            Self::InvalidConsolidationMaxInputs => ("invalid_consolidation_max_inputs", 400, false),
+            Self::WalletNotEnoughUtxos(_) => ("wallet_not_enough_utxos", 422, false),
+            Self::WalletConsolidationFee { .. } => ("wallet_consolidation_fee", 422, false),
+            Self::InvalidRpcRequest(_) => ("invalid_request", 400, false),
+            Self::RpcIo(_) => ("rpc_io", 500, true),
+            Self::SharedNodePoisoned => ("shared_node_poisoned", 500, false),
+            Self::Json(_) => ("invalid_json", 400, false),
+            Self::Network(_) => ("network_parameters", 500, false),
+            Self::Chain(_) => ("chain_rejected", 422, false),
+            Self::Wire(_) => ("wire_rejected", 400, false),
+            Self::Pow(_) => ("proof_rejected", 422, false),
+            Self::Economics(_) => ("economics", 500, false),
+        };
+        let message = match self {
+            Self::DataDirLocked(_) => "node data directory is already in use".to_owned(),
+            Self::Io { .. } => "node storage operation failed; inspect the node logs".to_owned(),
+            Self::CorruptLog(_) => {
+                "block log is corrupt; inspect the node logs before restarting".to_owned()
+            }
+            Self::NonLoopbackRpc(_) => "RPC must remain bound to loopback".to_owned(),
+            Self::RpcIo(_) => "node RPC I/O failed".to_owned(),
+            Self::Json(_) => "request JSON is invalid".to_owned(),
+            _ => self.to_string(),
+        };
+        NodeClientError {
+            code,
+            status,
+            retryable,
+            message,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeStatus {
     pub network: &'static str,
@@ -172,6 +252,236 @@ pub struct BlockTemplate {
     pub coinbase: Coinbase,
     pub transactions: Vec<Transaction>,
     pub total_fees_burned: u64,
+}
+
+/// An immutable block template paired with the exact consensus verifier.
+///
+/// A caller should create this while briefly holding its node lock, release
+/// that lock, and then search the job. A found block still has to pass through
+/// [`Node::submit_block`], which independently handles stale work, proof
+/// validation, persistence, and fork choice.
+#[derive(Debug, Clone)]
+pub struct MiningJob {
+    template: BlockTemplate,
+    verifier: ConsensusPowVerifier,
+}
+
+/// Exact progress from one bounded immutable mining-job search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MiningSearchResult {
+    Found {
+        block: Box<Block>,
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+    Exhausted {
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+    Cancelled {
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+}
+
+/// One independently recomputed pool-share candidate. A true
+/// `meets_share_target` makes it creditable by the pool; only a true
+/// `meets_chain_target` makes it eligible for block construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiningShareEvaluation {
+    pub proof: BlockProof,
+    pub work_digest: [u8; 32],
+    pub meets_share_target: bool,
+    pub meets_chain_target: bool,
+}
+
+/// Exact progress from one bounded immutable pool-share search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MiningShareSearchResult {
+    Found {
+        proof: BlockProof,
+        work_digest: [u8; 32],
+        meets_chain_target: bool,
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+    Exhausted {
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+    Cancelled {
+        attempts_completed: u64,
+        next_nonce: u64,
+    },
+}
+
+impl MiningJob {
+    /// The immutable consensus challenge represented by this job.
+    pub fn challenge(&self) -> &BlockChallenge {
+        &self.template.challenge
+    }
+
+    /// Searches a bounded wrapping nonce range without accessing mutable node
+    /// state. `should_cancel` is checked before every nonce evaluation.
+    ///
+    /// `next_nonce` always names the first nonce that was not evaluated. This
+    /// lets a continuous miner resume without repeating work, including across
+    /// the `u64::MAX` wrap boundary.
+    pub fn search_range<F>(
+        &self,
+        start_nonce: u64,
+        attempts: u64,
+        mut should_cancel: F,
+    ) -> Result<MiningSearchResult, NodeError>
+    where
+        F: FnMut() -> bool,
+    {
+        if attempts == 0 || attempts > MAX_MINING_SEARCH_ATTEMPTS {
+            return Err(NodeError::InvalidMiningSearchAttempts);
+        }
+
+        let mut attempts_completed = 0_u64;
+        while attempts_completed < attempts {
+            let nonce = start_nonce.wrapping_add(attempts_completed);
+            if should_cancel() {
+                return Ok(MiningSearchResult::Cancelled {
+                    attempts_completed,
+                    next_nonce: nonce,
+                });
+            }
+
+            match self.verifier.mine(&self.template.challenge, nonce, 1) {
+                Ok(proof) => {
+                    attempts_completed += 1;
+                    let block = Box::new(Block {
+                        version: BLOCK_VERSION,
+                        challenge: self.template.challenge,
+                        proof,
+                        coinbase: self.template.coinbase.clone(),
+                        transactions: self.template.transactions.clone(),
+                    });
+                    return Ok(MiningSearchResult::Found {
+                        block,
+                        attempts_completed,
+                        next_nonce: nonce.wrapping_add(1),
+                    });
+                }
+                Err(PowError::V1(ForgeMatrixError::NonceExhausted))
+                | Err(PowError::V2(ForgeMatrixV2Error::NonceExhausted)) => {
+                    attempts_completed += 1;
+                }
+                Err(error) => return Err(NodeError::Pow(error)),
+            }
+        }
+
+        Ok(MiningSearchResult::Exhausted {
+            attempts_completed,
+            next_nonce: start_nonce.wrapping_add(attempts_completed),
+        })
+    }
+
+    /// Recomputes the exact committed proof for a submitted nonce without
+    /// replacing the challenge's chain target. The separately assigned share
+    /// target is accepted only when it is easier than or equal to that chain
+    /// target.
+    pub fn evaluate_share(
+        &self,
+        nonce: u64,
+        share_target: [u8; 32],
+    ) -> Result<MiningShareEvaluation, NodeError> {
+        self.validate_share_target(share_target)?;
+        self.evaluate_share_unchecked(nonce, share_target)
+    }
+
+    /// Searches a bounded wrapping nonce range for a pool share. Cancellation
+    /// is checked before each exact ForgeMatrix evaluation, and `next_nonce`
+    /// always identifies the first nonce not evaluated.
+    pub fn search_share_range<F>(
+        &self,
+        start_nonce: u64,
+        attempts: u64,
+        share_target: [u8; 32],
+        mut should_cancel: F,
+    ) -> Result<MiningShareSearchResult, NodeError>
+    where
+        F: FnMut() -> bool,
+    {
+        if attempts == 0 || attempts > MAX_MINING_SEARCH_ATTEMPTS {
+            return Err(NodeError::InvalidMiningSearchAttempts);
+        }
+        self.validate_share_target(share_target)?;
+
+        let mut attempts_completed = 0_u64;
+        while attempts_completed < attempts {
+            let nonce = start_nonce.wrapping_add(attempts_completed);
+            if should_cancel() {
+                return Ok(MiningShareSearchResult::Cancelled {
+                    attempts_completed,
+                    next_nonce: nonce,
+                });
+            }
+
+            let evaluation = self.evaluate_share_unchecked(nonce, share_target)?;
+            attempts_completed += 1;
+            if evaluation.meets_share_target {
+                return Ok(MiningShareSearchResult::Found {
+                    proof: evaluation.proof,
+                    work_digest: evaluation.work_digest,
+                    meets_chain_target: evaluation.meets_chain_target,
+                    attempts_completed,
+                    next_nonce: nonce.wrapping_add(1),
+                });
+            }
+        }
+
+        Ok(MiningShareSearchResult::Exhausted {
+            attempts_completed,
+            next_nonce: start_nonce.wrapping_add(attempts_completed),
+        })
+    }
+
+    /// Revalidates an untrusted submitted proof and constructs the immutable
+    /// template's block only when the proof meets the original chain target.
+    /// The returned block still has to pass [`Node::submit_block`].
+    pub fn build_block_if_chain_valid(
+        &self,
+        proof: &BlockProof,
+    ) -> Result<Option<Box<Block>>, NodeError> {
+        self.verifier
+            .verify_evaluation(&self.template.challenge, proof)?;
+        if proof.work_digest() > self.template.challenge.target {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(Block {
+            version: BLOCK_VERSION,
+            challenge: self.template.challenge,
+            proof: proof.clone(),
+            coinbase: self.template.coinbase.clone(),
+            transactions: self.template.transactions.clone(),
+        })))
+    }
+
+    fn validate_share_target(&self, share_target: [u8; 32]) -> Result<(), NodeError> {
+        if share_target < self.template.challenge.target {
+            return Err(NodeError::InvalidMiningShareTarget);
+        }
+        Ok(())
+    }
+
+    fn evaluate_share_unchecked(
+        &self,
+        nonce: u64,
+        share_target: [u8; 32],
+    ) -> Result<MiningShareEvaluation, NodeError> {
+        let proof = self.verifier.evaluate(&self.template.challenge, nonce)?;
+        let work_digest = proof.work_digest();
+        Ok(MiningShareEvaluation {
+            proof,
+            work_digest,
+            meets_share_target: work_digest <= share_target,
+            meets_chain_target: work_digest <= self.template.challenge.target,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -226,19 +536,41 @@ pub struct WalletSnapshot {
     pub history: Vec<WalletHistoryEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct WalletSendRequest {
-    recipient: String,
-    amount: String,
-    fee: String,
+pub struct WalletSendRequest {
+    pub recipient: String,
+    pub amount: String,
+    pub fee: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct WalletConsolidateRequest {
-    fee: String,
-    max_inputs: usize,
+pub struct WalletConsolidateRequest {
+    pub fee: String,
+    pub max_inputs: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DevMineRequest {
+    pub miner: String,
+    pub attempts: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MempoolSnapshotEntry {
+    pub txid: String,
+    pub encoded_bytes: usize,
+    pub fee_burned: u64,
+    pub fee_burned_atoms: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MempoolSnapshot {
+    pub transactions: usize,
+    pub bytes: usize,
+    pub entries: Vec<MempoolSnapshotEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -268,6 +600,14 @@ pub struct WalletConsolidateResponse {
     pub fee_burned_atoms: String,
     pub mempool_transactions: usize,
     pub mempool_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DevMineResult {
+    pub accepted: bool,
+    pub block_id: String,
+    pub height: u64,
+    pub tip: String,
 }
 
 struct DataDirLock {
@@ -601,9 +941,21 @@ impl Node {
         })
     }
 
-    /// Creates and submits a payment from the intentionally public Devnet-0
-    /// demo key. Selection is value-descending with a stable outpoint tie-break
-    /// and never spends a mempool-reserved or immature output.
+    /// Validates a display-unit request and submits a payment from the
+    /// intentionally public Devnet-0 demo key.
+    pub fn send_from_dev_wallet_request(
+        &mut self,
+        request: WalletSendRequest,
+    ) -> Result<WalletSendResponse, NodeError> {
+        let recipient = parse_wallet_recipient(&request.recipient)?;
+        let amount = parse_cmfd_atoms(&request.amount)?;
+        if amount == 0 {
+            return Err(NodeError::WalletZeroAmount);
+        }
+        let fee = parse_cmfd_atoms(&request.fee)?;
+        self.send_from_dev_wallet(recipient, amount, fee)
+    }
+
     pub fn send_from_dev_wallet(
         &mut self,
         recipient: [u8; 32],
@@ -707,8 +1059,19 @@ impl Node {
         })
     }
 
-    /// Consolidates the smallest mature, unreserved demo-wallet outputs into
-    /// exactly one immediately spendable self-owned output.
+    /// Validates a display-unit request and consolidates the intentionally
+    /// public Devnet-0 demo wallet.
+    pub fn consolidate_dev_wallet_request(
+        &mut self,
+        request: WalletConsolidateRequest,
+    ) -> Result<WalletConsolidateResponse, NodeError> {
+        if !(2..=MAX_TRANSACTION_INPUTS).contains(&request.max_inputs) {
+            return Err(NodeError::InvalidConsolidationMaxInputs);
+        }
+        let fee = parse_cmfd_atoms(&request.fee)?;
+        self.consolidate_dev_wallet(fee, request.max_inputs)
+    }
+
     pub fn consolidate_dev_wallet(
         &mut self,
         fee_burned: u64,
@@ -1134,6 +1497,19 @@ impl Node {
         })
     }
 
+    /// Captures an immutable template and verifier for mining outside any
+    /// shared node lock.
+    pub fn build_mining_job(
+        &self,
+        miner_destination: [u8; 32],
+        now_unix_seconds: u64,
+    ) -> Result<MiningJob, NodeError> {
+        Ok(MiningJob {
+            template: self.build_template(miner_destination, now_unix_seconds)?,
+            verifier: self.verifier.clone(),
+        })
+    }
+
     /// Adds a transaction to the volatile, active-chain-only Devnet-0 mempool.
     ///
     /// Unconfirmed parents are intentionally unsupported: every input must be
@@ -1191,6 +1567,41 @@ impl Node {
 
     pub fn mempool_entries(&self) -> impl ExactSizeIterator<Item = &MempoolEntry> {
         self.mempool.values()
+    }
+
+    /// Returns the transport-neutral mempool view exposed by the Devnet-0 API.
+    pub fn mempool_snapshot(&self) -> MempoolSnapshot {
+        let entries = self
+            .mempool
+            .values()
+            .map(|entry| MempoolSnapshotEntry {
+                txid: hex::encode(entry.txid),
+                encoded_bytes: entry.encoded_bytes,
+                fee_burned: entry.fee_burned,
+                fee_burned_atoms: entry.fee_burned.to_string(),
+            })
+            .collect();
+        MempoolSnapshot {
+            transactions: self.mempool.len(),
+            bytes: self.mempool_bytes,
+            entries,
+        }
+    }
+
+    /// Validates and executes one bounded Devnet-0 mining request.
+    pub fn mine_devnet_request(
+        &mut self,
+        request: DevMineRequest,
+    ) -> Result<DevMineResult, NodeError> {
+        let (miner, attempts) = validate_dev_mine_request(&request)?;
+        let block = self.mine_once(miner, unix_time_seconds()?, attempts)?;
+        let status = self.status()?;
+        Ok(DevMineResult {
+            accepted: true,
+            block_id: hex::encode(block.block_id()),
+            height: status.accepted_height,
+            tip: status.tip,
+        })
     }
 
     pub fn mine_once(
@@ -1604,6 +2015,18 @@ impl RpcResponse {
     fn json_error(status: u16, reason: &'static str, error: impl ToString) -> Self {
         Self::json(status, reason, json!({ "error": error.to_string() }))
     }
+
+    fn node_error(error: NodeError) -> Self {
+        let error = error.client_error();
+        let reason = match error.status {
+            400 => "Bad Request",
+            409 => "Conflict",
+            422 => "Unprocessable Content",
+            503 => "Service Unavailable",
+            _ => "Internal Server Error",
+        };
+        Self::json(error.status, reason, json!({ "error": error.message }))
+    }
 }
 
 /// Runs the intentionally small, single-threaded Devnet-0 RPC service.
@@ -1627,7 +2050,7 @@ pub fn serve_rpc_shared(shared: Arc<Mutex<Node>>, bind: SocketAddr) -> Result<()
             Err(_) => continue,
         };
         if let Err(error) = handle_rpc_connection_shared(&mut stream, &shared) {
-            let response = RpcResponse::json_error(500, "Internal Server Error", error);
+            let response = RpcResponse::node_error(error);
             let _ = write_rpc_response(&mut stream, response);
         }
     }
@@ -1648,7 +2071,7 @@ fn handle_rpc_connection_shared(
     let request = match read_rpc_request(&mut deadline_reader) {
         Ok(request) => request,
         Err(error) => {
-            return write_rpc_response(stream, RpcResponse::json_error(400, "Bad Request", error));
+            return write_rpc_response(stream, RpcResponse::node_error(error));
         }
     };
     let response = {
@@ -1683,15 +2106,18 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                 Ok(value) => RpcResponse::json(200, "OK", value),
                 Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
             },
+            Err(error) => RpcResponse::node_error(error),
+        },
+        ("GET", "/v1/mempool") => match serde_json::to_value(node.mempool_snapshot()) {
+            Ok(value) => RpcResponse::json(200, "OK", value),
             Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
         },
-        ("GET", "/v1/mempool") => RpcResponse::json(200, "OK", mempool_json(node)),
         ("GET", "/v1/wallet") => match node.wallet_snapshot() {
             Ok(snapshot) => match serde_json::to_value(snapshot) {
                 Ok(value) => RpcResponse::json(200, "OK", value),
                 Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
             },
-            Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+            Err(error) => RpcResponse::node_error(error),
         },
         ("POST", "/v1/wallet/send") => {
             if !has_json_content_type(request.content_type.as_deref()) {
@@ -1705,51 +2131,12 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                 Ok(send) => send,
                 Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
             };
-            let recipient = match parse_wallet_recipient(&send.recipient) {
-                Ok(recipient) => recipient,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
-            };
-            let amount = match parse_cmfd_atoms(&send.amount) {
-                Ok(0) => {
-                    return RpcResponse::json_error(
-                        400,
-                        "Bad Request",
-                        NodeError::WalletZeroAmount,
-                    );
-                }
-                Ok(amount) => amount,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
-            };
-            let fee = match parse_cmfd_atoms(&send.fee) {
-                Ok(fee) => fee,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
-            };
-            match node.send_from_dev_wallet(recipient, amount, fee) {
+            match node.send_from_dev_wallet_request(send) {
                 Ok(response) => match serde_json::to_value(response) {
                     Ok(value) => RpcResponse::json(200, "OK", value),
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
                 },
-                Err(
-                    error @ (NodeError::DuplicateMempoolTransaction(_)
-                    | NodeError::MempoolInputConflict(_)),
-                ) => RpcResponse::json_error(409, "Conflict", error),
-                Err(
-                    error @ (NodeError::WalletFundsImmature { .. }
-                    | NodeError::WalletInsufficientFunds { .. }
-                    | NodeError::WalletInputLimit { .. }
-                    | NodeError::MempoolUnconfirmedInput(_)
-                    | NodeError::MempoolTransactionLimit
-                    | NodeError::MempoolByteLimit
-                    | NodeError::MempoolFeeTooLow { .. }
-                    | NodeError::Chain(_)),
-                ) => RpcResponse::json_error(422, "Unprocessable Content", error),
-                Err(
-                    error @ (NodeError::InvalidWalletRecipient
-                    | NodeError::InvalidWalletAmount
-                    | NodeError::WalletAmountOverflow
-                    | NodeError::WalletZeroAmount),
-                ) => RpcResponse::json_error(400, "Bad Request", error),
-                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                Err(error) => RpcResponse::node_error(error),
             }
         }
         ("POST", "/v1/wallet/consolidate") => {
@@ -1765,41 +2152,12 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                     Ok(consolidation) => consolidation,
                     Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
                 };
-            if !(2..=MAX_TRANSACTION_INPUTS).contains(&consolidation.max_inputs) {
-                return RpcResponse::json_error(
-                    400,
-                    "Bad Request",
-                    NodeError::InvalidConsolidationMaxInputs,
-                );
-            }
-            let fee = match parse_cmfd_atoms(&consolidation.fee) {
-                Ok(fee) => fee,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
-            };
-            match node.consolidate_dev_wallet(fee, consolidation.max_inputs) {
+            match node.consolidate_dev_wallet_request(consolidation) {
                 Ok(response) => match serde_json::to_value(response) {
                     Ok(value) => RpcResponse::json(200, "OK", value),
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
                 },
-                Err(
-                    error @ (NodeError::DuplicateMempoolTransaction(_)
-                    | NodeError::MempoolInputConflict(_)),
-                ) => RpcResponse::json_error(409, "Conflict", error),
-                Err(
-                    error @ (NodeError::WalletNotEnoughUtxos(_)
-                    | NodeError::WalletConsolidationFee { .. }
-                    | NodeError::MempoolUnconfirmedInput(_)
-                    | NodeError::MempoolTransactionLimit
-                    | NodeError::MempoolByteLimit
-                    | NodeError::MempoolFeeTooLow { .. }
-                    | NodeError::Chain(_)),
-                ) => RpcResponse::json_error(422, "Unprocessable Content", error),
-                Err(
-                    error @ (NodeError::InvalidConsolidationMaxInputs
-                    | NodeError::InvalidWalletAmount
-                    | NodeError::WalletAmountOverflow),
-                ) => RpcResponse::json_error(400, "Bad Request", error),
-                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                Err(error) => RpcResponse::node_error(error),
             }
         }
         ("GET", target) if target.starts_with("/v1/template?") => {
@@ -1879,37 +2237,16 @@ fn route_rpc_request(request: RpcRequest, node: &mut Node) -> RpcResponse {
                     "mine endpoint requires an empty body",
                 );
             }
-            let (miner, attempts) = match parse_mine_request(target) {
-                Ok(values) => values,
-                Err(error) => return RpcResponse::json_error(400, "Bad Request", error),
+            let request = match parse_mine_request(target) {
+                Ok(request) => request,
+                Err(error) => return RpcResponse::node_error(error),
             };
-            let now = match unix_time_seconds() {
-                Ok(now) => now,
-                Err(error) => {
-                    return RpcResponse::json_error(500, "Internal Server Error", error);
-                }
-            };
-            match node.mine_once(miner, now, attempts) {
-                Ok(block) => match node.status() {
-                    Ok(status) => RpcResponse::json(
-                        200,
-                        "OK",
-                        json!({
-                            "accepted": true,
-                            "block_id": hex::encode(block.block_id()),
-                            "height": status.accepted_height,
-                            "tip": status.tip,
-                        }),
-                    ),
+            match node.mine_devnet_request(request) {
+                Ok(result) => match serde_json::to_value(result) {
+                    Ok(value) => RpcResponse::json(200, "OK", value),
                     Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
                 },
-                Err(NodeError::StorageFaulted) => {
-                    RpcResponse::json_error(503, "Service Unavailable", NodeError::StorageFaulted)
-                }
-                Err(error @ (NodeError::Pow(_) | NodeError::Chain(_))) => {
-                    RpcResponse::json_error(422, "Unprocessable Content", error)
-                }
-                Err(error) => RpcResponse::json_error(500, "Internal Server Error", error),
+                Err(error) => RpcResponse::node_error(error),
             }
         }
         ("POST", "/v1/block") => {
@@ -2043,7 +2380,7 @@ fn parse_template_miner(target: &str) -> Result<[u8; 32], NodeError> {
     parse_miner_destination(value)
 }
 
-fn parse_mine_request(target: &str) -> Result<([u8; 32], u64), NodeError> {
+fn parse_mine_request(target: &str) -> Result<DevMineRequest, NodeError> {
     let (path, query) = target
         .split_once('?')
         .ok_or_else(|| NodeError::InvalidRpcRequest("mine requires query parameters".to_owned()))?;
@@ -2060,16 +2397,11 @@ fn parse_mine_request(target: &str) -> Result<([u8; 32], u64), NodeError> {
             NodeError::InvalidRpcRequest("malformed mine query parameter".to_owned())
         })?;
         match name {
-            "miner" if miner.is_none() => miner = Some(parse_miner_destination(value)?),
+            "miner" if miner.is_none() => miner = Some(value.to_owned()),
             "attempts" if attempts.is_none() => {
                 let parsed = value.parse::<u64>().map_err(|_| {
                     NodeError::InvalidRpcRequest("mine attempts must be an integer".to_owned())
                 })?;
-                if parsed == 0 || parsed > DEFAULT_MINING_ATTEMPTS {
-                    return Err(NodeError::InvalidRpcRequest(format!(
-                        "mine attempts must be between 1 and {DEFAULT_MINING_ATTEMPTS}"
-                    )));
-                }
                 attempts = Some(parsed);
             }
             _ => {
@@ -2085,7 +2417,17 @@ fn parse_mine_request(target: &str) -> Result<([u8; 32], u64), NodeError> {
     let attempts = attempts.ok_or_else(|| {
         NodeError::InvalidRpcRequest("mine requires an attempts parameter".to_owned())
     })?;
-    Ok((miner, attempts))
+    Ok(DevMineRequest { miner, attempts })
+}
+
+fn validate_dev_mine_request(request: &DevMineRequest) -> Result<([u8; 32], u64), NodeError> {
+    let miner = parse_miner_destination(&request.miner)?;
+    if request.attempts == 0 || request.attempts > DEFAULT_MINING_ATTEMPTS {
+        return Err(NodeError::InvalidRpcRequest(format!(
+            "mine attempts must be between 1 and {DEFAULT_MINING_ATTEMPTS}"
+        )));
+    }
+    Ok((miner, request.attempts))
 }
 
 fn template_json(template: &BlockTemplate) -> serde_json::Value {
@@ -2126,26 +2468,6 @@ fn template_json(template: &BlockTemplate) -> serde_json::Value {
             .map(|transaction| hex::encode(transaction.txid()))
             .collect::<Vec<_>>(),
         "fees_burned": template.total_fees_burned,
-    })
-}
-
-fn mempool_json(node: &Node) -> serde_json::Value {
-    let entries: Vec<_> = node
-        .mempool
-        .values()
-        .map(|entry| {
-            json!({
-                "txid": hex::encode(entry.txid),
-                "encoded_bytes": entry.encoded_bytes,
-                "fee_burned": entry.fee_burned,
-                "fee_burned_atoms": entry.fee_burned.to_string(),
-            })
-        })
-        .collect();
-    json!({
-        "transactions": node.mempool.len(),
-        "bytes": node.mempool_bytes,
-        "entries": entries,
     })
 }
 
@@ -2969,6 +3291,305 @@ mod tests {
     }
 
     #[test]
+    fn immutable_mining_job_searches_after_node_unlock_and_submits_normally() {
+        let path = test_dir("immutable-mining-job");
+        clean_test_dir(&path);
+        let now = 1_800_000_000;
+        let job = {
+            let node = Node::open(&path).unwrap();
+            let job = node
+                .build_mining_job(default_miner_destination(), now)
+                .unwrap();
+            assert_eq!(job.challenge().height, 1);
+            job
+        };
+
+        let result = job
+            .search_range(0, MAX_MINING_SEARCH_ATTEMPTS, || false)
+            .unwrap();
+        let (block, attempts_completed, next_nonce) = match result {
+            MiningSearchResult::Found {
+                block,
+                attempts_completed,
+                next_nonce,
+            } => (block, attempts_completed, next_nonce),
+            other => panic!("expected a winning Devnet range, received {other:?}"),
+        };
+        let proof_nonce = match &block.proof {
+            BlockProof::V1Legacy(proof) => proof.nonce,
+            BlockProof::V2Reference(proof) => proof.nonce,
+        };
+        assert_eq!(attempts_completed, proof_nonce.wrapping_add(1));
+        assert_eq!(next_nonce, proof_nonce.wrapping_add(1));
+
+        let block_id = block.block_id();
+        let mut node = Node::open(&path).unwrap();
+        node.submit_block(*block, now).unwrap();
+        assert_eq!(node.status().unwrap().tip, hex::encode(block_id));
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn mining_job_range_is_bounded_cancellable_and_wrap_safe() {
+        let path = test_dir("mining-job-bounds");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let job = node
+            .build_mining_job(default_miner_destination(), 1_800_000_000)
+            .unwrap();
+        drop(node);
+
+        assert!(matches!(
+            job.search_range(0, 0, || false),
+            Err(NodeError::InvalidMiningSearchAttempts)
+        ));
+        assert!(matches!(
+            job.search_range(0, MAX_MINING_SEARCH_ATTEMPTS + 1, || false),
+            Err(NodeError::InvalidMiningSearchAttempts)
+        ));
+
+        assert_eq!(
+            job.search_range(41, 1, || true).unwrap(),
+            MiningSearchResult::Cancelled {
+                attempts_completed: 0,
+                next_nonce: 41,
+            }
+        );
+
+        let mut losing_nonce = 0_u64;
+        loop {
+            match job.search_range(losing_nonce, 1, || false).unwrap() {
+                MiningSearchResult::Exhausted { .. } => break,
+                MiningSearchResult::Found { .. } => {
+                    losing_nonce = losing_nonce.wrapping_add(1);
+                }
+                MiningSearchResult::Cancelled { .. } => {
+                    panic!("non-cancelling search unexpectedly cancelled")
+                }
+            }
+        }
+        let mut cancellation_checks = 0;
+        assert_eq!(
+            job.search_range(losing_nonce, 2, || {
+                cancellation_checks += 1;
+                cancellation_checks > 1
+            })
+            .unwrap(),
+            MiningSearchResult::Cancelled {
+                attempts_completed: 1,
+                next_nonce: losing_nonce.wrapping_add(1),
+            }
+        );
+
+        let wrapped = job.search_range(u64::MAX, 1, || false).unwrap();
+        match wrapped {
+            MiningSearchResult::Found {
+                attempts_completed,
+                next_nonce,
+                ..
+            }
+            | MiningSearchResult::Exhausted {
+                attempts_completed,
+                next_nonce,
+            } => {
+                assert_eq!(attempts_completed, 1);
+                assert_eq!(next_nonce, 0);
+            }
+            MiningSearchResult::Cancelled { .. } => {
+                panic!("non-cancelling wrapping search unexpectedly cancelled")
+            }
+        }
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn pool_share_evaluation_separates_share_work_from_chain_work() {
+        let path = test_dir("pool-share-separation");
+        clean_test_dir(&path);
+        let now = 1_800_000_000;
+        let mut node = Node::open(&path).unwrap();
+        let job = node
+            .build_mining_job(default_miner_destination(), now)
+            .unwrap();
+        let chain_target = job.challenge().target;
+        assert!(chain_target > [0; 32]);
+
+        let invalid_target = job.evaluate_share(0, [0; 32]).unwrap_err();
+        assert!(matches!(
+            invalid_target,
+            NodeError::InvalidMiningShareTarget
+        ));
+        assert_eq!(
+            invalid_target.client_error().code,
+            "invalid_mining_share_target"
+        );
+
+        let mut share_only_nonce = 0_u64;
+        let share_only = loop {
+            let evaluation = job.evaluate_share(share_only_nonce, [0xff; 32]).unwrap();
+            if !evaluation.meets_chain_target {
+                break evaluation;
+            }
+            share_only_nonce = share_only_nonce.wrapping_add(1);
+        };
+        assert!(share_only.meets_share_target);
+        assert!(!share_only.meets_chain_target);
+        assert_eq!(
+            share_only.work_digest,
+            share_only.proof.work_digest(),
+            "the exported digest must match the independently recomputed proof"
+        );
+        assert!(
+            job.build_block_if_chain_valid(&share_only.proof)
+                .unwrap()
+                .is_none()
+        );
+
+        let searched = job
+            .search_share_range(share_only_nonce, 1, [0xff; 32], || false)
+            .unwrap();
+        assert_eq!(
+            searched,
+            MiningShareSearchResult::Found {
+                proof: share_only.proof.clone(),
+                work_digest: share_only.work_digest,
+                meets_chain_target: false,
+                attempts_completed: 1,
+                next_nonce: share_only_nonce.wrapping_add(1),
+            }
+        );
+
+        let mut mutated_work = share_only.proof.clone();
+        match &mut mutated_work {
+            BlockProof::V1Legacy(proof) => proof.work_digest[0] ^= 1,
+            BlockProof::V2Reference(proof) => proof.work_digest[0] ^= 1,
+        }
+        assert!(job.build_block_if_chain_valid(&mutated_work).is_err());
+
+        let mut mutated_nonce = share_only.proof;
+        match &mut mutated_nonce {
+            BlockProof::V1Legacy(proof) => proof.nonce = proof.nonce.wrapping_add(1),
+            BlockProof::V2Reference(proof) => proof.nonce = proof.nonce.wrapping_add(1),
+        }
+        assert!(job.build_block_if_chain_valid(&mutated_nonce).is_err());
+
+        let block_proof = match job
+            .search_share_range(0, MAX_MINING_SEARCH_ATTEMPTS, chain_target, || false)
+            .unwrap()
+        {
+            MiningShareSearchResult::Found {
+                proof,
+                work_digest,
+                meets_chain_target,
+                ..
+            } => {
+                assert!(meets_chain_target);
+                assert!(work_digest <= chain_target);
+                proof
+            }
+            other => panic!("expected a chain-valid share, received {other:?}"),
+        };
+        let block = job
+            .build_block_if_chain_valid(&block_proof)
+            .unwrap()
+            .expect("chain-valid proof must construct a block");
+        assert_eq!(block.challenge.target, chain_target);
+        node.submit_block(*block, now).unwrap();
+        assert_eq!(node.status().unwrap().accepted_height, 1);
+
+        drop(node);
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn pool_share_search_is_bounded_cancellable_and_wrap_safe() {
+        let path = test_dir("pool-share-search-bounds");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let job = node
+            .build_mining_job(default_miner_destination(), 1_800_000_000)
+            .unwrap();
+        drop(node);
+        let chain_target = job.challenge().target;
+
+        assert!(matches!(
+            job.search_share_range(0, 0, chain_target, || false),
+            Err(NodeError::InvalidMiningSearchAttempts)
+        ));
+        assert!(matches!(
+            job.search_share_range(0, MAX_MINING_SEARCH_ATTEMPTS + 1, chain_target, || false),
+            Err(NodeError::InvalidMiningSearchAttempts)
+        ));
+        assert!(matches!(
+            job.search_share_range(0, 1, [0; 32], || false),
+            Err(NodeError::InvalidMiningShareTarget)
+        ));
+        assert_eq!(
+            job.search_share_range(41, 1, chain_target, || true)
+                .unwrap(),
+            MiningShareSearchResult::Cancelled {
+                attempts_completed: 0,
+                next_nonce: 41,
+            }
+        );
+
+        let mut losing_nonce = 0_u64;
+        loop {
+            let first = job.evaluate_share(losing_nonce, chain_target).unwrap();
+            let second = job
+                .evaluate_share(losing_nonce.wrapping_add(1), chain_target)
+                .unwrap();
+            if !first.meets_share_target && !second.meets_share_target {
+                break;
+            }
+            losing_nonce = losing_nonce.wrapping_add(1);
+        }
+        assert_eq!(
+            job.search_share_range(losing_nonce, 1, chain_target, || false)
+                .unwrap(),
+            MiningShareSearchResult::Exhausted {
+                attempts_completed: 1,
+                next_nonce: losing_nonce.wrapping_add(1),
+            }
+        );
+
+        let mut cancellation_checks = 0;
+        assert_eq!(
+            job.search_share_range(losing_nonce, 2, chain_target, || {
+                cancellation_checks += 1;
+                cancellation_checks > 1
+            })
+            .unwrap(),
+            MiningShareSearchResult::Cancelled {
+                attempts_completed: 1,
+                next_nonce: losing_nonce.wrapping_add(1),
+            }
+        );
+
+        match job
+            .search_share_range(u64::MAX, 1, [0xff; 32], || false)
+            .unwrap()
+        {
+            MiningShareSearchResult::Found {
+                attempts_completed,
+                next_nonce,
+                proof,
+                work_digest,
+                ..
+            } => {
+                assert_eq!(attempts_completed, 1);
+                assert_eq!(next_nonce, 0);
+                assert_eq!(proof.work_digest(), work_digest);
+            }
+            other => panic!("maximum share target must accept one wrapped nonce: {other:?}"),
+        }
+
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn preexisting_unlocked_lock_file_is_refreshed_without_blocking_open() {
         let path = test_dir("lock-preexisting");
         clean_test_dir(&path);
@@ -3398,15 +4019,13 @@ mod tests {
                 "/v1/mine?attempts={DEFAULT_MINING_ATTEMPTS}&miner={miner}"
             ))
             .unwrap(),
-            (default_miner_destination(), DEFAULT_MINING_ATTEMPTS)
+            DevMineRequest {
+                miner: miner.clone(),
+                attempts: DEFAULT_MINING_ATTEMPTS,
+            }
         );
         for target in [
             format!("/v1/mine?miner={miner}"),
-            format!("/v1/mine?miner={miner}&attempts=0"),
-            format!(
-                "/v1/mine?miner={miner}&attempts={}",
-                DEFAULT_MINING_ATTEMPTS + 1
-            ),
             format!("/v1/mine?miner={miner}&miner={miner}&attempts=1"),
             format!("/v1/mine?miner={miner}&attempts=1&extra=1"),
         ] {
@@ -3415,6 +4034,221 @@ mod tests {
                 Err(NodeError::InvalidRpcRequest(_))
             ));
         }
+        for attempts in [0, DEFAULT_MINING_ATTEMPTS + 1] {
+            let request =
+                parse_mine_request(&format!("/v1/mine?miner={miner}&attempts={attempts}")).unwrap();
+            assert!(matches!(
+                validate_dev_mine_request(&request),
+                Err(NodeError::InvalidRpcRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn transport_dtos_preserve_the_json_contract_and_reject_unknown_fields() {
+        let send = WalletSendRequest {
+            recipient: "ab".repeat(32),
+            amount: "1.25000000".to_owned(),
+            fee: "0.00000001".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&send).unwrap(),
+            json!({
+                "recipient": "ab".repeat(32),
+                "amount": "1.25000000",
+                "fee": "0.00000001",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<WalletSendRequest>(serde_json::to_value(&send).unwrap())
+                .unwrap(),
+            send
+        );
+        assert!(
+            serde_json::from_value::<WalletSendRequest>(json!({
+                "recipient": "ab".repeat(32),
+                "amount": "1",
+                "fee": "0.00000001",
+                "extra": true,
+            }))
+            .is_err()
+        );
+
+        let consolidation = WalletConsolidateRequest {
+            fee: "0.00001000".to_owned(),
+            max_inputs: 128,
+        };
+        assert_eq!(
+            serde_json::to_value(&consolidation).unwrap(),
+            json!({"fee": "0.00001000", "max_inputs": 128})
+        );
+        assert!(
+            serde_json::from_value::<WalletConsolidateRequest>(json!({
+                "fee": "0.00001000",
+                "max_inputs": 128,
+                "extra": true,
+            }))
+            .is_err()
+        );
+
+        let mine = DevMineRequest {
+            miner: "cd".repeat(32),
+            attempts: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&mine).unwrap(),
+            json!({"miner": "cd".repeat(32), "attempts": 42})
+        );
+        assert!(
+            serde_json::from_value::<DevMineRequest>(json!({
+                "miner": "cd".repeat(32),
+                "attempts": 42,
+                "extra": true,
+            }))
+            .is_err()
+        );
+
+        let mempool = MempoolSnapshot {
+            transactions: 1,
+            bytes: 99,
+            entries: vec![MempoolSnapshotEntry {
+                txid: "ef".repeat(32),
+                encoded_bytes: 99,
+                fee_burned: 7,
+                fee_burned_atoms: "7".to_owned(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&mempool).unwrap(),
+            json!({
+                "transactions": 1,
+                "bytes": 99,
+                "entries": [{
+                    "txid": "ef".repeat(32),
+                    "encoded_bytes": 99,
+                    "fee_burned": 7,
+                    "fee_burned_atoms": "7",
+                }],
+            })
+        );
+
+        let mined = DevMineResult {
+            accepted: true,
+            block_id: "01".repeat(32),
+            height: 3,
+            tip: "01".repeat(32),
+        };
+        assert_eq!(
+            serde_json::to_value(&mined).unwrap(),
+            json!({
+                "accepted": true,
+                "block_id": "01".repeat(32),
+                "height": 3,
+                "tip": "01".repeat(32),
+            })
+        );
+    }
+
+    #[test]
+    fn client_errors_are_stable_and_redact_storage_details() {
+        let raw_error = NodeError::Io {
+            operation: "read private wallet",
+            path: PathBuf::from(r"C:\secret-wallet\seed.txt"),
+            source: io::Error::new(io::ErrorKind::PermissionDenied, "credential=do-not-leak"),
+        };
+        let classified = raw_error.client_error();
+        assert_eq!(classified.code, "storage_io");
+        assert_eq!(classified.status, 500);
+        assert!(!classified.retryable);
+        assert_eq!(
+            classified.message,
+            "node storage operation failed; inspect the node logs"
+        );
+        assert!(!classified.message.contains("secret-wallet"));
+        assert!(!classified.message.contains("credential"));
+        assert_eq!(
+            serde_json::to_value(&classified).unwrap(),
+            json!({
+                "code": "storage_io",
+                "status": 500,
+                "retryable": false,
+                "message": "node storage operation failed; inspect the node logs",
+            })
+        );
+
+        let response = RpcResponse::node_error(raw_error);
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+            json!({"error": "node storage operation failed; inspect the node logs"})
+        );
+
+        let immature = NodeError::WalletFundsImmature {
+            immature: 20,
+            required: 30,
+        }
+        .client_error();
+        assert_eq!(immature.code, "wallet_funds_immature");
+        assert_eq!(immature.status, 422);
+        assert!(immature.retryable);
+        assert_eq!(
+            immature.message,
+            "wallet funds are immature: 20 atoms immature, 30 atoms required"
+        );
+
+        let faulted = NodeError::StorageFaulted.client_error();
+        assert_eq!(faulted.code, "storage_faulted");
+        assert_eq!(faulted.status, 503);
+        assert!(!faulted.retryable);
+    }
+
+    #[test]
+    fn transport_neutral_methods_share_validation_without_mutating_the_node() {
+        let path = test_dir("transport-method-validation");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+
+        assert!(matches!(
+            node.send_from_dev_wallet_request(WalletSendRequest {
+                recipient: "00".to_owned(),
+                amount: "1".to_owned(),
+                fee: "0.00000001".to_owned(),
+            }),
+            Err(NodeError::InvalidWalletRecipient)
+        ));
+        assert!(matches!(
+            node.consolidate_dev_wallet_request(WalletConsolidateRequest {
+                fee: "0.00001000".to_owned(),
+                max_inputs: 1,
+            }),
+            Err(NodeError::InvalidConsolidationMaxInputs)
+        ));
+        assert!(matches!(
+            node.mine_devnet_request(DevMineRequest {
+                miner: hex::encode(default_miner_destination()),
+                attempts: 0,
+            }),
+            Err(NodeError::InvalidRpcRequest(_))
+        ));
+        assert!(matches!(
+            node.mine_devnet_request(DevMineRequest {
+                miner: hex::encode(default_miner_destination()),
+                attempts: DEFAULT_MINING_ATTEMPTS + 1,
+            }),
+            Err(NodeError::InvalidRpcRequest(_))
+        ));
+
+        assert_eq!(
+            node.mempool_snapshot(),
+            MempoolSnapshot {
+                transactions: 0,
+                bytes: 0,
+                entries: Vec::new(),
+            }
+        );
+        assert_eq!(node.status().unwrap().accepted_height, 0);
+        drop(node);
+        clean_test_dir(&path);
     }
 
     #[test]
@@ -3559,6 +4393,7 @@ mod tests {
         assert_eq!(submitted_body["txid"], hex::encode(txid));
         assert_eq!(submitted_body["fee_burned"], 10);
 
+        let direct_snapshot = serde_json::to_value(node.mempool_snapshot()).unwrap();
         let listed = route_rpc_request(
             RpcRequest {
                 method: "GET".to_owned(),
@@ -3570,6 +4405,7 @@ mod tests {
         );
         assert_eq!(listed.status, 200);
         let listed_body: serde_json::Value = serde_json::from_slice(&listed.body).unwrap();
+        assert_eq!(listed_body, direct_snapshot);
         assert_eq!(listed_body["transactions"], 1);
         assert_eq!(listed_body["entries"][0]["txid"], hex::encode(txid));
         assert_eq!(listed_body["entries"][0]["fee_burned"], 10);
@@ -3590,9 +4426,17 @@ mod tests {
         );
         assert_eq!(mined.status, 200);
         let mined_body: serde_json::Value = serde_json::from_slice(&mined.body).unwrap();
-        assert_eq!(mined_body["accepted"], true);
-        assert_eq!(mined_body["height"], 2);
-        assert_eq!(mined_body["block_id"].as_str().unwrap().len(), 64);
+        let block_id = mined_body["block_id"].as_str().unwrap().to_owned();
+        assert_eq!(block_id.len(), 64);
+        assert_eq!(
+            mined_body,
+            json!({
+                "accepted": true,
+                "block_id": block_id,
+                "height": 2,
+                "tip": block_id,
+            })
+        );
         assert!(node.mempool.is_empty());
         assert_eq!(node.mempool_bytes, 0);
         drop(node);

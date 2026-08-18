@@ -4,11 +4,12 @@ import {
   ArrowUpFromLine,
   Blocks,
   LayoutDashboard,
+  Pickaxe,
   Settings,
 } from "lucide-react";
 import mark from "../assets/common-foundry-mark.png";
 
-export type ViewName = "overview" | "transactions" | "network";
+export type ViewName = "overview" | "transactions" | "mining" | "network";
 
 interface SidebarProps {
   active: ViewName;
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { id: "send" as const, label: "Send", icon: ArrowUpFromLine },
   { id: "receive" as const, label: "Receive", icon: ArrowDownToLine },
   { id: "transactions" as const, label: "Transactions", icon: Activity },
+  { id: "mining" as const, label: "Mining", icon: Pickaxe },
   { id: "network" as const, label: "Network", icon: Blocks },
 ];
 

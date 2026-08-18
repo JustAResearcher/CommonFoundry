@@ -2,8 +2,8 @@ import {
   Activity,
   ArrowDownToLine,
   ArrowUpFromLine,
-  Blocks,
   LayoutDashboard,
+  Pickaxe,
 } from "lucide-react";
 import type { ViewName } from "./Sidebar";
 
@@ -33,9 +33,9 @@ export function MobileNav({ active, onNavigate, onSend, onReceive }: MobileNavPr
         <Activity aria-hidden="true" size={20} />
         <span>Activity</span>
       </button>
-      <button className={active === "network" ? "is-active" : ""} onClick={() => onNavigate("network")} type="button">
-        <Blocks aria-hidden="true" size={20} />
-        <span>Network</span>
+      <button className={active === "mining" ? "is-active" : ""} onClick={() => onNavigate("mining")} type="button">
+        <Pickaxe aria-hidden="true" size={20} />
+        <span>Mining</span>
       </button>
     </nav>
   );

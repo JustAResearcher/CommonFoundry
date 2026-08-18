@@ -1,22 +1,28 @@
 {
   "name": "@common-foundry/wallet",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.0-devnet.2",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "dev:desktop": "vite --host 127.0.0.1 --mode tauri",
     "build": "tsc -b && vite build",
+    "build:desktop": "tsc -b && vite build --mode tauri",
     "check": "tsc -b --pretty false",
     "test": "vitest run",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
   },
   "dependencies": {
+    "@tauri-apps/api": "2.11.1",
     "lucide-react": "1.32.0",
     "qrcode.react": "4.2.0",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.5",

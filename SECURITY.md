@@ -40,19 +40,21 @@ Mainnet remains disabled until all of the following are complete:
 Devnet-0 now has bounded private-address static-peer sessions, full block
 validation before indexing, cumulative-chainwork fork choice and reorgs, a
 checksummed append-only block log with consensus replay, touched-state atomic
-active-chain validation, and a bounded volatile mempool with pull-only static
-peer propagation. Those features make it a private multi-node test harness;
-they do not make it safe for public peers or valuable funds.
+active-chain validation, a bounded volatile mempool with pull-only static peer
+propagation, and a bounded CMFD-specific pool test protocol. Those features
+make it a private multi-node test harness; they do not make it safe for public
+peers or valuable funds.
 
 Before any untrusted public testnet, the networking and storage design needs
 explicit abuse, latency, and crash-recovery bounds. Peers are statically
 configured and compatibility-checked by network ID and consensus fingerprint,
-but are not identity-authenticated; transport is unencrypted, with no peer
+but are not identity-authenticated; P2P transport is unencrypted, with no peer
 discovery, NAT traversal, reputation/ban system, or demonstrated DDoS
 resilience. Extending a side branch currently reconstructs that branch from
 genesis, which is deliberately Devnet-only and not scalable. The mempool is
 volatile and intentionally excludes unconfirmed-parent packages. There is no
-production wallet/key custody, production miner protocol, or optimized miner.
+production wallet/key custody, durable pool payout system, or optimized GPU
+miner.
 
 The local Devnet GUI and wallet RPC use one fixed, source-visible signing key
 shared by every checkout. They can display active-chain balances and history,
@@ -61,12 +63,70 @@ but they provide no key generation, encrypted storage, backup, or recovery.
 They are private Devnet test tools for valueless funds, not a production wallet.
 Never use the shared destination for real value.
 
+The native desktop wallet embeds the node and exposes only an explicit Tauri
+command allowlist to its bundled webview. It does not open the loopback HTTP RPC
+listener. The browser developer workflow still uses the loopback Vite proxy and
+inherits the RPC limitations documented in the Devnet guide.
+
+Continuous desktop mining uses the tiny CPU full-recomputation profile. Its
+performance counter is a count of complete ForgeMatrix nonce evaluations, not
+a GPU hashrate or proof of physical VRAM residency.
+
+The Devnet pool is a CMFD-specific length-bounded job/share protocol over TLS
+1.3; it is not Stratum. A client authenticates the server by comparing the
+SHA-256 digest of the exact leaf-certificate DER bytes with the 64-hex pin in
+its `cmfd+tls://...?...` URL. The TLS handshake still verifies that the pinned
+certificate signed the handshake, but there is no CA trust path, client
+certificate, worker identity proof, or automatic secure pin distribution.
+Worker and payout claims are not client-authenticated, so session counters are
+not identity-secure. Operators must transfer and verify the certificate pin out
+of band and must never distribute the private key. The generator creates the
+private-key DER with mode `0600` on Unix; Windows depends on the containing
+directory's ACLs. Keep the certificate public, restrict both the key file and
+pool data directory to the operator account, and distribute only the
+certificate SHA-256 pin. Both client and server accept only numeric loopback,
+RFC1918 IPv4, or IPv6 unique-local endpoints. TLS protects this one pool
+connection; it does not encrypt or authenticate the separate P2P protocol.
+
+Each pool job binds its identifier to an immutable `BlockChallenge` and a
+separate easier share target. Relation evaluation is deliberately targetless:
+the server reconstructs the proof and work digest for the submitted nonce,
+then compares that digest independently with the share target and the
+challenge's chain target. A share target must be easier than or equal to the
+chain target. It is never written into `BlockChallenge`, and a share-only proof
+cannot construct a block. The server accepts a block only after the recomputed
+proof meets the original chain target and ordinary block submission validates
+it. Never accept a client-claimed digest or proof and never substitute a pool
+share target for the committed chain target.
+
+Pool resource and accounting state is intentionally bounded and in memory.
+Duplicate nonces, stale jobs, low-difficulty shares, oversized frames, excess
+connections, and configured record limits are rejected. Accepted-share,
+rejected-share, block, and credited-atom values are session-only, valueless,
+nonwithdrawable test counters that reset when the pool process restarts. The
+client payout field is only an untrusted accounting label. The block's miner
+reward output goes to the pool operator's configured destination; there is no
+secure ownership mapping, crash-safe or reorganization-aware accounting,
+withdrawal mechanism, or on-chain payout ledger. Because the current wallet
+key is shared and public, no displayed pool counter represents money owed to a
+distinct user.
+
+Production pool activation requires unique wallet and pool key custody,
+persistent auditable and reorganization-aware share/reward accounting, an
+on-chain payout mechanism, optimized GPU mining and proof generation,
+share-verification queue and denial-of-service analysis, fuzzing and load
+tests, independent implementations, and external audits. The Devnet TLS pool
+must not be exposed to the public Internet or used with valuable funds.
+
 A completed, sound proof can establish the committed function, not physical GPU
 use or VRAM residency. No such hardware claim may be used to weaken the
 arithmetic proof or any gate above.
 
-No public vulnerability-reporting endpoint is configured yet. Until one is,
-report potential vulnerabilities to the project owner through an established
-private channel and do not place working consensus bypasses or mainnet exploit
-instructions in public issues. Private vulnerability reporting with a named
-security contact must be configured before this repository is publicly hosted.
+Report vulnerabilities through GitHub's private advisory form:
+
+<https://github.com/JustAResearcher/CommonFoundry/security/advisories/new>
+
+Do not place working consensus bypasses, wallet exploits, private keys, or
+mainnet exploit instructions in public issues. Include affected versions,
+reproduction conditions, impact, and any proposed mitigation in the private
+report.

@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-wallet",
+  "description": "Minimal capability for the trusted Common Foundry wallet window.",
+  "windows": ["main"],
+  "platforms": ["windows", "linux"],
+  "permissions": ["wallet-commands"]
+}

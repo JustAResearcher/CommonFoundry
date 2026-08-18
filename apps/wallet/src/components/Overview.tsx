@@ -85,7 +85,7 @@ export function Overview({
             <RefreshCw aria-hidden="true" size={16} className={refreshing ? "spin" : ""} />
           </button>
         </div>
-        <p>Local RPC responding</p>
+        <p>Local node responding</p>
         <div className="node-stat-list">
           <div>
             <span>Block height</span>

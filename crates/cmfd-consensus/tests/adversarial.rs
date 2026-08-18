@@ -1,7 +1,8 @@
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
-    BlockChallenge, CoinbaseClaim, DEFAULT_MONETARY_POLICY, EconomicsError, ForgeMatrixError,
-    ForgeMatrixVerifier, TEST_PROFILE,
+    BlockChallenge, BlockProof, CoinbaseClaim, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY,
+    EconomicsError, ForgeMatrixError, ForgeMatrixV2Error, ForgeMatrixVerifier, PowError,
+    TEST_PROFILE, v2_test_reference,
 };
 
 fn block() -> BlockChallenge {
@@ -150,6 +151,76 @@ fn a_valid_computation_still_has_to_meet_difficulty() {
         verifier.verify(&impossible, &proof),
         Err(ForgeMatrixError::HighHash)
     );
+}
+
+#[test]
+fn targetless_evaluation_never_weakens_the_committed_chain_target() {
+    let mut v1_block = block();
+    v1_block.target = [0; 32];
+    let v1 = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+    let v1_proof = v1.evaluate(&v1_block, 17).unwrap();
+    assert_ne!(v1_proof.work_digest(), [0; 32]);
+    v1.verify_evaluation(&v1_block, &v1_proof).unwrap();
+    assert!(matches!(
+        v1.verify(&v1_block, &v1_proof),
+        Err(PowError::V1(ForgeMatrixError::HighHash))
+    ));
+
+    let v2_reference = v2_test_reference().unwrap();
+    let mut v2_block = block();
+    v2_block.network_id = v2_reference.descriptor().network_id;
+    v2_block.target = [0; 32];
+    let v2 = ConsensusPowVerifier::v2_reference(v2_reference);
+    let v2_proof = v2.evaluate(&v2_block, 17).unwrap();
+    assert_ne!(v2_proof.work_digest(), [0; 32]);
+    v2.verify_evaluation(&v2_block, &v2_proof).unwrap();
+    assert!(matches!(
+        v2.verify(&v2_block, &v2_proof),
+        Err(PowError::V2(ForgeMatrixV2Error::HighHash))
+    ));
+}
+
+#[test]
+fn targetless_evaluation_rejects_mutated_proofs_nonces_and_chain_targets() {
+    let v1 = ConsensusPowVerifier::v1_legacy(TEST_PROFILE).unwrap();
+    let v1_block = block();
+    let v1_proof = v1.evaluate(&v1_block, 29).unwrap();
+    let mut mutated_work = v1_proof.clone();
+    let BlockProof::V1Legacy(proof) = &mut mutated_work else {
+        unreachable!();
+    };
+    proof.work_digest[0] ^= 1;
+    assert!(v1.verify_evaluation(&v1_block, &mutated_work).is_err());
+    let mut mutated_nonce = v1_proof.clone();
+    let BlockProof::V1Legacy(proof) = &mut mutated_nonce else {
+        unreachable!();
+    };
+    proof.nonce = proof.nonce.wrapping_add(1);
+    assert!(v1.verify_evaluation(&v1_block, &mutated_nonce).is_err());
+    let mut weakened_target = v1_block;
+    weakened_target.target = [0xfe; 32];
+    assert!(v1.verify_evaluation(&weakened_target, &v1_proof).is_err());
+
+    let v2_reference = v2_test_reference().unwrap();
+    let mut v2_block = block();
+    v2_block.network_id = v2_reference.descriptor().network_id;
+    let v2 = ConsensusPowVerifier::v2_reference(v2_reference);
+    let v2_proof = v2.evaluate(&v2_block, 29).unwrap();
+    let mut mutated_work = v2_proof.clone();
+    let BlockProof::V2Reference(proof) = &mut mutated_work else {
+        unreachable!();
+    };
+    proof.work_digest[0] ^= 1;
+    assert!(v2.verify_evaluation(&v2_block, &mutated_work).is_err());
+    let mut mutated_nonce = v2_proof.clone();
+    let BlockProof::V2Reference(proof) = &mut mutated_nonce else {
+        unreachable!();
+    };
+    proof.nonce = proof.nonce.wrapping_add(1);
+    assert!(v2.verify_evaluation(&v2_block, &mutated_nonce).is_err());
+    let mut weakened_target = v2_block;
+    weakened_target.target = [0xfe; 32];
+    assert!(v2.verify_evaluation(&weakened_target, &v2_proof).is_err());
 }
 
 #[test]

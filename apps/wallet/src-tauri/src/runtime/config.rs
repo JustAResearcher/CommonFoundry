@@ -1,0 +1,218 @@
+use std::fmt;
+use std::net::SocketAddr;
+
+use cmfd_node::DEFAULT_P2P_ADDRESS;
+use cmfd_node::peer::{PeerLimits, StaticPeerConfig};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct NodeRuntimeConfig {
+    pub(super) p2p_bind: SocketAddr,
+    pub(super) peers: Vec<SocketAddr>,
+}
+
+impl NodeRuntimeConfig {
+    pub(super) fn from_process_args() -> Result<Self, ConfigError> {
+        let mut args = Vec::new();
+        for argument in std::env::args_os().skip(1) {
+            let argument = argument
+                .into_string()
+                .map_err(|_| ConfigError::NonUnicodeArgument)?;
+            args.push(argument);
+        }
+        Self::parse(args)
+    }
+
+    fn parse<I, S>(arguments: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let default_bind = DEFAULT_P2P_ADDRESS
+            .parse()
+            .map_err(|_| ConfigError::InvalidBuiltInDefault)?;
+        let mut p2p_bind = None;
+        let mut peers = Vec::new();
+        let mut arguments = arguments.into_iter().map(Into::into);
+
+        while let Some(argument) = arguments.next() {
+            match argument.as_str() {
+                "--p2p-bind" => {
+                    if p2p_bind.is_some() {
+                        return Err(ConfigError::DuplicateOption("--p2p-bind"));
+                    }
+                    let value = arguments
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--p2p-bind"))?;
+                    p2p_bind = Some(parse_address("--p2p-bind", &value)?);
+                }
+                "--peer" => {
+                    let value = arguments
+                        .next()
+                        .ok_or(ConfigError::MissingValue("--peer"))?;
+                    peers.push(parse_address("--peer", &value)?);
+                }
+                _ if argument.starts_with("--p2p-bind=") => {
+                    if p2p_bind.is_some() {
+                        return Err(ConfigError::DuplicateOption("--p2p-bind"));
+                    }
+                    let value = argument
+                        .strip_prefix("--p2p-bind=")
+                        .expect("prefix was checked");
+                    p2p_bind = Some(parse_address("--p2p-bind", value)?);
+                }
+                _ if argument.starts_with("--peer=") => {
+                    let value = argument
+                        .strip_prefix("--peer=")
+                        .expect("prefix was checked");
+                    peers.push(parse_address("--peer", value)?);
+                }
+                _ => return Err(ConfigError::UnknownArgument(argument)),
+            }
+        }
+
+        let config = Self {
+            p2p_bind: p2p_bind.unwrap_or(default_bind),
+            peers,
+        };
+        config.static_peers(PeerLimits::default()).validate()?;
+        Ok(config)
+    }
+
+    pub(super) fn static_peers(&self, limits: PeerLimits) -> StaticPeerConfig {
+        StaticPeerConfig {
+            listen_address: self.p2p_bind,
+            peers: self.peers.clone(),
+            limits,
+        }
+    }
+}
+
+fn parse_address(option: &'static str, value: &str) -> Result<SocketAddr, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidAddress {
+        option,
+        value: value.to_owned(),
+    })
+}
+
+#[derive(Debug)]
+pub(super) enum ConfigError {
+    NonUnicodeArgument,
+    InvalidBuiltInDefault,
+    UnknownArgument(String),
+    MissingValue(&'static str),
+    DuplicateOption(&'static str),
+    InvalidAddress { option: &'static str, value: String },
+    InvalidPrivatePeerConfiguration(String),
+}
+
+impl From<cmfd_node::peer::PeerError> for ConfigError {
+    fn from(error: cmfd_node::peer::PeerError) -> Self {
+        Self::InvalidPrivatePeerConfiguration(error.to_string())
+    }
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonUnicodeArgument => {
+                formatter.write_str("wallet node arguments must be valid Unicode")
+            }
+            Self::InvalidBuiltInDefault => {
+                formatter.write_str("the built-in P2P listener address is invalid")
+            }
+            Self::UnknownArgument(argument) => {
+                write!(formatter, "unknown wallet argument: {argument}")
+            }
+            Self::MissingValue(option) => write!(formatter, "{option} requires an IP:port value"),
+            Self::DuplicateOption(option) => {
+                write!(formatter, "{option} may only be specified once")
+            }
+            Self::InvalidAddress { option, value } => {
+                write!(
+                    formatter,
+                    "{option} requires a numeric IP:port, received {value}"
+                )
+            }
+            Self::InvalidPrivatePeerConfiguration(message) => formatter.write_str(message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn double_click_defaults_to_loopback_without_outbound_peers() {
+        let config = NodeRuntimeConfig::parse(Vec::<String>::new()).unwrap();
+
+        assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
+        assert!(config.peers.is_empty());
+    }
+
+    #[test]
+    fn private_bind_and_repeatable_peers_are_accepted() {
+        let config = NodeRuntimeConfig::parse([
+            "--p2p-bind",
+            "192.168.50.10:18444",
+            "--peer=192.168.50.11:18444",
+            "--peer",
+            "[fd12:3456::12]:18444",
+        ])
+        .unwrap();
+
+        assert_eq!(config.p2p_bind, "192.168.50.10:18444".parse().unwrap());
+        assert_eq!(
+            config.peers,
+            [
+                "192.168.50.11:18444".parse().unwrap(),
+                "[fd12:3456::12]:18444".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn public_unspecified_duplicate_and_self_addresses_are_rejected() {
+        for arguments in [
+            vec!["--peer", "8.8.8.8:18444"],
+            vec!["--p2p-bind", "0.0.0.0:18444"],
+            vec!["--peer", "127.0.0.1:18444"],
+            vec!["--peer", "127.0.0.1:18454", "--peer", "127.0.0.1:18454"],
+        ] {
+            assert!(
+                matches!(
+                    NodeRuntimeConfig::parse(arguments),
+                    Err(ConfigError::InvalidPrivatePeerConfiguration(_))
+                ),
+                "configuration unexpectedly passed validation"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_options_are_rejected() {
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--peer"]),
+            Err(ConfigError::MissingValue("--peer"))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--peer", "localhost:18444"]),
+            Err(ConfigError::InvalidAddress {
+                option: "--peer",
+                ..
+            })
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse([
+                "--p2p-bind=127.0.0.1:18445",
+                "--p2p-bind",
+                "127.0.0.1:18446"
+            ]),
+            Err(ConfigError::DuplicateOption("--p2p-bind"))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--unknown"]),
+            Err(ConfigError::UnknownArgument(_))
+        ));
+    }
+}

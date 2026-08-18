@@ -8,10 +8,43 @@ permissions:
   contents: read
 
 jobs:
-  rust:
-    runs-on: ubuntu-latest
+  msrv:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
+      - run: cargo check --workspace --all-targets --locked
+
+  rust:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            wget
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
@@ -36,3 +69,65 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run build
+
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: common-foundry-wallet-windows
+            bundle-path: target/release/bundle
+            binary-path: target/release/common-foundry-wallet.exe
+            node-path: target/release/cmfd-node.exe
+          - os: ubuntu-22.04
+            artifact: common-foundry-wallet-linux
+            bundle-path: target/release/bundle
+            binary-path: target/release/common-foundry-wallet
+            node-path: target/release/cmfd-node
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential \
+            curl \
+            file \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            wget
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/wallet/package-lock.json
+      - run: npm ci
+        working-directory: apps/wallet
+      - name: Build static Windows node CLI
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked -p cmfd-node
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+      - name: Build Linux node CLI
+        if: runner.os == 'Linux'
+        run: cargo build --release --locked -p cmfd-node
+      - run: npm run desktop:build -- --ci -- --locked
+        working-directory: apps/wallet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.bundle-path }}
+            ${{ matrix.binary-path }}
+            ${{ matrix.node-path }}
+          if-no-files-found: error

@@ -321,7 +321,10 @@
 .hygiene-card,
 .mempool-card,
 .node-details-card,
-.forge-card {
+.forge-card,
+.mining-status-card,
+.mining-disclosure-card,
+.mining-control-card {
   background: var(--mineral-50);
   border: 1px solid var(--mineral-300);
   border-radius: 7px;
@@ -1056,6 +1059,464 @@
   line-height: 1.45;
 }
 
+.mining-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  align-items: start;
+  gap: 20px;
+}
+
+.mining-main-column {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.mining-status-card,
+.mining-disclosure-card {
+  overflow: hidden;
+  box-shadow: none;
+}
+
+.mining-heading {
+  min-height: 72px;
+}
+
+.mining-state {
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--ink-700);
+  background: var(--mineral-150);
+  border: 1px solid var(--mineral-200);
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.mining-state i {
+  width: 7px;
+  height: 7px;
+  background: #92918d;
+  border-radius: 50%;
+}
+
+.mining-state.is-running {
+  color: var(--green-600);
+  background: var(--green-100);
+  border-color: #c7e3ce;
+}
+
+.mining-state.is-running i {
+  background: var(--green-600);
+  box-shadow: 0 0 0 3px rgba(51, 116, 71, 0.12);
+}
+
+.mining-state.is-error {
+  color: var(--red-600);
+  background: var(--red-100);
+  border-color: #edc8c4;
+}
+
+.mining-state.is-error i {
+  background: var(--red-600);
+}
+
+.mining-rate {
+  padding: 29px 25px 26px;
+}
+
+.mining-rate > span {
+  color: var(--ink-500);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.mining-rate > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.mining-rate strong {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(39px, 5vw, 58px);
+  font-weight: 500;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.mining-rate em {
+  color: var(--copper-600);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+.mining-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border-top: 1px solid var(--mineral-200);
+  border-bottom: 1px solid var(--mineral-200);
+}
+
+.mining-metrics > div {
+  min-width: 0;
+  padding: 16px 19px;
+}
+
+.mining-metrics > div + div {
+  border-left: 1px solid var(--mineral-200);
+}
+
+.mining-metrics dt,
+.mining-last-block > div > span,
+.reference-engine-row > div > span {
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.mining-metrics dd {
+  margin: 7px 0 0;
+  overflow: hidden;
+  color: var(--ink-700);
+  font-size: 13px;
+  font-weight: 720;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mining-last-block {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 16px 21px;
+}
+
+.mining-detail-icon {
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--copper-600);
+  background: var(--copper-100);
+  border-radius: 50%;
+}
+
+.mining-last-block > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mining-last-block strong {
+  overflow: hidden;
+  color: var(--ink-700);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mining-disclosure-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.mining-disclosure-grid > div {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 20px;
+}
+
+.mining-disclosure-grid > div + div {
+  border-left: 1px solid var(--mineral-200);
+}
+
+.mining-disclosure-grid strong {
+  display: block;
+  margin-top: 1px;
+  font-size: 11px;
+}
+
+.mining-disclosure-grid p {
+  margin: 5px 0 0;
+  color: var(--ink-500);
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.mining-proof-warning {
+  margin: 0 20px 20px;
+}
+
+.mining-control-card {
+  padding: 23px;
+}
+
+.mining-control-card h2 {
+  margin: 7px 0 9px;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 23px;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+}
+
+.mining-control-card > p {
+  min-height: 51px;
+  margin: 0;
+  color: var(--ink-500);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.mining-mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 3px;
+  margin: 18px 0;
+  padding: 3px;
+  background: var(--mineral-150);
+  border: 1px solid var(--mineral-200);
+  border-radius: 6px;
+}
+
+.mining-mode-switch button {
+  min-height: 34px;
+  color: var(--ink-500);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.mining-mode-switch button.is-active {
+  color: var(--ink-900);
+  background: #fff;
+  box-shadow: 0 2px 7px rgba(32, 27, 22, 0.08);
+}
+
+.mining-mode-switch button:disabled {
+  cursor: not-allowed;
+  opacity: 0.66;
+}
+
+.reference-engine-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 17px;
+  padding: 11px 12px;
+  background: var(--mineral-100);
+  border: 1px solid var(--mineral-200);
+  border-radius: 5px;
+}
+
+.reference-engine-row .mining-detail-icon {
+  width: 30px;
+  height: 30px;
+}
+
+.reference-engine-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.reference-engine-row strong {
+  color: var(--ink-700);
+  font-size: 10px;
+}
+
+.pool-configuration {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 4px 0 18px;
+}
+
+.pool-protocol {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 11px;
+  color: #855032;
+  background: var(--amber-100);
+  border: 1px solid #efd7c7;
+  border-radius: 5px;
+}
+
+.pool-protocol svg {
+  flex: none;
+}
+
+.pool-protocol > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.pool-protocol strong {
+  font-size: 10px;
+}
+
+.pool-protocol span {
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.pool-configuration label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.pool-configuration input {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  color: var(--ink-700);
+  background: #fff;
+  border: 1px solid var(--mineral-200);
+  border-radius: 5px;
+  font-size: 10px;
+}
+
+.pool-configuration input:focus {
+  border-color: var(--copper-500);
+  box-shadow: 0 0 0 3px rgba(177, 103, 57, 0.1);
+  outline: 0;
+}
+
+.pool-configuration input[aria-invalid="true"] {
+  border-color: #cf877f;
+}
+
+.pool-configuration input:disabled {
+  cursor: not-allowed;
+  opacity: 0.78;
+}
+
+.pool-field-help,
+.pool-field-error {
+  font-size: 8px;
+  font-weight: 550;
+  letter-spacing: 0;
+  line-height: 1.45;
+  text-transform: none;
+}
+
+.pool-field-help {
+  color: var(--ink-500);
+}
+
+.pool-field-error {
+  color: var(--red-600);
+}
+
+.pool-credit-destination {
+  margin: 0;
+}
+
+.pool-connection-row strong.is-connected {
+  color: var(--green-600);
+}
+
+.pool-context-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(90px, auto));
+  gap: 24px;
+  margin: 0 0 0 auto;
+}
+
+.pool-context-metrics div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.pool-context-metrics dt {
+  color: var(--ink-500);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+  text-transform: uppercase;
+}
+
+.pool-context-metrics dd {
+  margin: 0;
+  color: var(--ink-700);
+  font-size: 11px;
+  font-weight: 720;
+  font-variant-numeric: tabular-nums;
+}
+
+.pool-credit-note {
+  margin: 0 20px 20px;
+}
+
+.mining-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mining-error button {
+  width: 25px;
+  height: 25px;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--red-600);
+  background: transparent;
+  border: 0;
+}
+
+.mining-primary {
+  margin-top: 4px;
+}
+
+.mining-primary.is-stop {
+  background: var(--graphite-850);
+  border-color: var(--graphite-700);
+  box-shadow: 0 4px 12px rgba(20, 21, 21, 0.15);
+}
+
+.mining-control-card > small {
+  display: block;
+  margin-top: 9px;
+  color: var(--ink-500);
+  font-size: 9px;
+  line-height: 1.45;
+  text-align: center;
+}
+
 .spin {
   animation: spin 800ms linear infinite;
 }
@@ -1637,7 +2098,8 @@
   }
 
   .transactions-layout,
-  .network-layout {
+  .network-layout,
+  .mining-layout {
     grid-template-columns: minmax(0, 1fr) 270px;
   }
 }
@@ -1653,8 +2115,17 @@
 
   .overview-grid,
   .transactions-layout,
-  .network-layout {
+  .network-layout,
+  .mining-layout {
     grid-template-columns: 1fr;
+  }
+
+  .mining-control-card {
+    grid-row: 1;
+  }
+
+  .mining-main-column {
+    grid-row: 2;
   }
 
   .node-rail,
@@ -1727,8 +2198,59 @@
 
   .overview-grid,
   .transactions-layout,
-  .network-layout {
+  .network-layout,
+  .mining-layout,
+  .mining-main-column {
     gap: 13px;
+  }
+
+  .mining-control-card {
+    padding: 20px;
+  }
+
+  .mining-rate {
+    padding: 23px 20px;
+  }
+
+  .mining-rate > div {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .mining-rate strong {
+    font-size: 42px;
+  }
+
+  .mining-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mining-metrics > div:nth-child(3) {
+    border-left: 0;
+  }
+
+  .mining-metrics > div:nth-child(n + 3) {
+    border-top: 1px solid var(--mineral-200);
+  }
+
+  .mining-disclosure-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .mining-disclosure-grid > div + div {
+    border-top: 1px solid var(--mineral-200);
+    border-left: 0;
+  }
+
+  .pool-connection-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .pool-context-metrics {
+    width: 100%;
+    margin-left: 45px;
   }
 
   .balance-card {

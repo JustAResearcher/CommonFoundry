@@ -8,7 +8,7 @@ Version 0.1 - August 2026
 
 Common Foundry Research
 
-> **Status: research protocol - not mainnet.** Common Foundry Devnet-0 is a private, valueless test network. It implements canonical ledger rules, exact tiny-profile ForgeMatrix v2 replay, multi-node synchronization, fork choice, fee burning, and inference-channel settlement accounting. The proposed production ForgeMatrix profile and succinct proof system are hard-disabled. They require cryptographic implementation, benchmark evidence, independent implementations, public adversarial testing, and two external audits before any public-value activation.
+> **Status: research protocol - not mainnet.** Common Foundry Devnet-0 is a private, valueless test network. It implements canonical ledger rules, exact tiny-profile ForgeMatrix v2 replay, multi-node synchronization, fork choice, fee burning, inference-channel settlement accounting, and a pinned-TLS pool test protocol with volatile session counters. The proposed production ForgeMatrix profile and succinct proof system are hard-disabled. They require cryptographic implementation, benchmark evidence, independent implementations, public adversarial testing, and two external audits before any public-value activation.
 
 ---
 
@@ -16,7 +16,7 @@ Common Foundry Research
 
 Common Foundry is a research architecture for a proposed permissionless proof-of-work ledger that coordinates GPU computation. It separates two activities that are often conflated in claims about "useful proof of work." First, a deterministic, public, matrix-heavy function called ForgeMatrix orders blocks and secures settlement. Second, the proposed market would let customers purchase actual inference directly from GPU providers through prepaid, progressively authorized payment channels denominated in CMFD. The mining function is not customer inference, and an inference receipt is not a proof that a model answer is correct. This separation is intentional: consensus must remain deterministic, self-contained, and independently verifiable, while commercial inference is heterogeneous, latency-sensitive, and frequently private.
 
-ForgeMatrix v2 is designed around exact signed integer matrix multiplication over a seedless committed 6 GiB weight bank. Its proposed production profile evaluates 384 sequential 4096 by 4096 layers over a batch of 128 rows, totaling 824,633,720,832 multiply-accumulate operations per nonce. A block-specific affine mask and a range-bound cubic transition over the prime 134,217,689 prevent the earlier small-modulus accumulator shortcut. The intended verifier is a non-zero-knowledge GKR/sumcheck protocol backed by a transparent multilinear polynomial commitment scheme. The proof must bind every layer, exact integer ranges, the model artifact, the block challenge, the winning nonce, the target, and the final activation digest.
+ForgeMatrix v2 is designed around signed INT8 by signed INT8 matrix multiplication with exact INT32 accumulation over a seedless committed 6 GiB weight bank. Its proposed production profile evaluates 384 sequential 4096 by 4096 layers over a batch of 128 rows, totaling 824,633,720,832 multiply-accumulate operations per nonce. A block-specific affine mask and a range-bound cubic transition over the prime 134,217,689 prevent the earlier small-modulus accumulator shortcut. The intended verifier is a non-zero-knowledge GKR/sumcheck protocol backed by a transparent multilinear polynomial commitment scheme. The proof must bind every layer, exact integer ranges, the model artifact, the block challenge, the winning nonce, the target, and the final activation digest.
 
 The current software does not yet contain that production proof. Devnet-0 deliberately uses a tiny 2 by 4 by 4 profile and validates it by full recomputation. This paper therefore distinguishes three states throughout: **implemented**, **Devnet reference**, and **production proposal**. It also states a fundamental limitation: software consensus can prove evaluation of a committed arithmetic relation, but cannot prove which physical processor ran it or that bytes resided in GPU VRAM.
 
@@ -35,7 +35,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
 | **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
 
-The current tagged research release is `v0.1.0-devnet.1`, anchored to commit `e81de049f618ab14d61dd72162430f5178cb1eef`. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+This revision describes the `v0.1.0-devnet.2` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
 
 This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
 
@@ -93,7 +93,7 @@ Common Foundry consists of four layers:
 1. **Consensus library.** Canonical transactions and blocks, UTXO state transitions, reward allocation, fee burning, difficulty, proof selection, and wire encoding.
 2. **ForgeMatrix proof-of-work.** A public, block-bound computation and its proposed succinct proof.
 3. **Inference payment protocol.** Signed cumulative customer authorizations, provider receipts, and on-chain settlement or refund.
-4. **Node and wallet runtime.** Static private peer synchronization, forks, persistence, mempool, mining templates, loopback RPC, and a Devnet wallet interface.
+4. **Node and wallet runtime.** Static private peer synchronization, forks, persistence, mempool, mining templates, loopback RPC, a CMFD-specific Devnet pool service, and a Devnet wallet interface.
 
 The crates separate responsibilities for review. Consensus explicitly imports the marketplace types and rules that govern channel spends, while the node consumes canonical consensus objects; this is an audit boundary, not cryptographic or dependency isolation. Any marketplace function reached from consensus is consensus-critical and must be versioned, reviewed, and tested with the same discipline as the ledger rules.
 
@@ -768,6 +768,91 @@ Miner consolidation deliberately chooses mature, unreserved outputs smallest-fir
 
 Current key custody is intentionally unsafe: every source checkout shares a fixed, public Devnet private key. There is no secure key generation, encryption, backup, recovery, hardware-wallet integration, or multi-user isolation. The GUI and wallet must never be used for value.
 
+### 11.5 Devnet pool protocol
+
+Devnet-0 implements a small Common Foundry job/share protocol so several wallet
+miners can exercise coordinated ForgeMatrix work. It is not Bitcoin Stratum
+and does not reuse Stratum job semantics. The service accepts only numeric
+loopback, RFC1918 IPv4, or IPv6 unique-local endpoints and uses TLS 1.3. Each
+message is JSON inside a 4-byte big-endian length prefix with a 16 KiB maximum.
+The pool command also runs the node's private P2P inbound listener and optional
+static-peer poller against the same node state, allowing accepted pool blocks
+to propagate through an explicitly configured private topology.
+
+Pool clients pin the SHA-256 digest of the exact DER-encoded leaf certificate.
+The custom verifier compares all 32 digest bytes and still verifies the TLS
+handshake signature using the pinned certificate. It does not use public CA
+trust, DNS identity, or client certificates. The pin therefore has to be
+transferred and verified through a separate trusted channel. TLS authenticates
+the pinned server endpoint and encrypts this pool socket; worker and payout
+claims are not client-authenticated, so session counters are not
+identity-secure. TLS does not protect the independent P2P transport. Operators
+publish the certificate and pin but never the private key. Generated key files
+use mode `0600` on Unix; Windows deployments depend on restrictive directory
+ACLs for both the key and pool data.
+
+The initial client message supplies protocol version, network ID, consensus
+fingerprint, worker label, and payout label. The server checks compatibility,
+assigns a session ID, states the volatile accounting semantics, and returns a
+job containing:
+
+- a server-issued job identifier;
+- the complete immutable `BlockChallenge`; and
+- a separate share target that is easier than or equal to the challenge's
+  chain target.
+
+The job identifier binds fresh server/job entropy, a sequence, the challenge,
+and the selected share target. A worker evaluates the committed relation over
+that challenge and submits only the job identifier and nonce. It does not
+supply a trusted proof or work digest.
+
+Let `E(C, n)` be exact ForgeMatrix evaluation of challenge `C` at nonce `n`,
+let `D(E)` be its 256-bit work digest, let `T_c` be the chain target committed
+inside `C`, and let `T_s` be the separately transported share target. Threshold
+ordering uses the ordinary lower-digest-wins convention, so the server requires
+`T_s >= T_c`. For every submission it independently computes:
+
+```text
+P = E(C, n)
+d = D(P)
+share accepted       iff d <= T_s
+block candidate      iff d <= T_c
+```
+
+This is targetless relation evaluation followed by two independent target
+comparisons. `T_s` is never written into or substituted for `C.target`.
+Consequently a proof that qualifies only as a share cannot be converted into a
+block. When `d <= T_c`, the server reconstructs the candidate from the original
+job and recomputed proof, then sends it through ordinary node block submission,
+which again enforces consensus validation. Tip changes rotate the job; stale
+job IDs, repeated nonces, low-difficulty shares, malformed frames, and excess
+resource use are rejected.
+
+The current compile-time limits are 64 concurrent sessions, 1,000,000 messages
+per session, 65,536 valid nonce records per job, 1,024 recent session records,
+and 1,024 recent payout-label records. Finished connection threads are reaped;
+inactive accounting records are pruned within the stated caps. These bounds are
+Devnet engineering controls, not evidence of public-network denial-of-service
+maturity.
+
+The pool ledger is deliberately bounded, volatile test instrumentation.
+Accepted/rejected shares, found blocks, and credited Devnet atoms are tracked
+by connection session and payout label in memory, then discarded on process
+restart. The default counter adds one test atom per accepted share. These
+numbers are valueless and nonwithdrawable: they are not funds, debt, custody,
+or an on-chain balance. The payout field is an untrusted label and does not
+control the miner reward output. A valid block sends that output to the pool
+server's configured destination. The shared source-visible wallet key also
+prevents secure per-user ownership.
+
+A production pool requires unique user and operator key custody, durable
+auditable share records, reorganization-aware reward maturity and reversal,
+explicit payout construction and confirmation, withdrawal limits, optimized
+GPU miners and proof generation, bounded verification queues, share-proof DoS
+analysis, monitoring, load and fuzz testing, independent implementations, and
+external audits. The implemented pool is only a private Devnet interoperability
+path.
+
 ## 12. Security model
 
 ### 12.1 Consensus assumptions
@@ -796,6 +881,9 @@ It does not assume miners follow a reference kernel. Any implementation computin
 | Substitute final output | Prove final digest or publish bytes | Unresolved production blocker |
 | Reuse proof on another block | Challenge binds network, model, parent, root, height, time, target, nonce | Implemented in reference path |
 | Claim an easier target | Chain independently derives target before proof verification | Implemented |
+| Substitute a pool share target for chain work | Targetless relation replay, separate comparisons, immutable challenge target | Implemented for Devnet pool |
+| Claim an uncomputed pool share | Submit nonce only; server independently recomputes proof and digest | Implemented at tiny Devnet scale |
+| Treat pool counters as owned funds | Explicit volatile/nonwithdrawable semantics and operator-directed miner output | No production payout ledger or user custody |
 | Cross-network replay | Full network ID in objects and fingerprint handshake | Implemented |
 | Forge polynomial openings | Transparent PCS with canonical openings | Not implemented |
 | Fake raw-to-PCS equivalence | Verifiable link certificate | Not implemented |
@@ -811,9 +899,12 @@ Devnet fork choice is functionally testable, but its tiny CPU-recomputed work pr
 
 ### 12.3 Public-network gaps
 
-Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, and full body validation are meaningful controls. They do not make a public node safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. Side-branch reconstruction replays from genesis. RPC is single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability are minimal.
+Devnet's parser caps, local RPC restriction, consensus fingerprint, durable replay, full body validation, and pinned-TLS pool transport are meaningful controls. They do not make a public node or pool safe. The P2P layer has no peer identity authentication, encryption, discovery, ban system, reputation, eclipse resistance, or mature denial-of-service strategy. The pool has no client identity, secure pin distribution, persistent or reorganization-aware payout accounting, withdrawal path, production share proof, or hardened verification queue. Side-branch reconstruction replays from genesis. RPC is single-threaded around shared node state. Storage has no pruning or snapshot path. Logs and peer observability are minimal.
 
-Release artifacts have SHA-256 checksums, but the release tag and binaries are unsigned and there is no checked-in reproducible packaging workflow, SBOM, or provenance attestation.
+Release artifacts have SHA-256 checksums, and CI contains checked-in Windows
+and Linux desktop build jobs. The release tag and binaries remain unsigned,
+however, and the workflow does not yet provide byte-for-byte reproducibility,
+an SBOM, signed provenance, or an attestation.
 
 ## 13. Implementation status
 
@@ -832,7 +923,8 @@ Release artifacts have SHA-256 checksums, but the release tag and binaries are u
 | P2P | Bounded static private pull | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
 | Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
-| Wallet | Real Devnet balance, send, receive, mine, consolidation | Production custody, backup, recovery, hardware signing |
+| Pool | Pinned-TLS CMFD job/share transport, server replay, volatile bounded counters | Unique custody, persistent reorg-aware ledger, payouts, optimized proofs and DoS hardening |
+| Wallet | Real Devnet balance, send, receive, solo/pool mine, consolidation | Production custody, backup, recovery, hardware signing |
 | Inference channel | Pricing, signed states/receipts, close/refund accounting | Quote/job transport, execution, discovery, reputation, disputes |
 | Governance | Fixed visible steward/community destinations | Secure multisig, beneficial-owner disclosure, reporting, change process |
 | Audits | Internal tests and review only | Two independent external audits |
@@ -858,7 +950,12 @@ Production ForgeMatrix must remain disabled until all of the following are met:
 13. An adversarial public testnet exercises forks, reorgs, restart, model distribution, proof propagation, mixed hardware, and economic attacks.
 14. Two teams independent of the designers complete cryptographic and implementation audits.
 
-Public-network readiness additionally requires secure wallet custody, authenticated peer design or a documented alternative trust model, DDoS and eclipse testing, scalable state/storage, operational telemetry, incident response, signed releases, and transparent governance of the steward and community destinations.
+Public-network readiness additionally requires secure wallet and pool custody,
+authenticated peer design or a documented alternative trust model, persistent
+and reorganization-aware pool payouts, hardened share-proof admission, DDoS and
+eclipse testing, scalable state/storage, operational telemetry, incident
+response, signed releases, and transparent governance of the steward and
+community destinations.
 
 ## 15. Design alternatives considered
 
@@ -898,9 +995,19 @@ Paying fees to miners creates a conventional inclusion market and may strengthen
 
 Common Foundry proposes a clear separation of concerns. A fixed, deterministic matrix relation secures ledger ordering. The proposed market would let customers and GPU providers negotiate real inference independently and settle bounded exposure through cumulative payment channels. A visible five-year funding stream supports miners, stewardship, and community work; all usage fees are burned; a miner-only tail sustains long-run proof-of-work issuance.
 
-The current Devnet demonstrates that these components can be made concrete enough to test: canonical encoding, network-bound signatures, exact v2 arithmetic, chain-derived targets, cumulative-work reorganization, durable replay, deterministic mempool behavior, real fee burning, channel settlement accounting, and miner UTXO consolidation all execute today at research scale.
+The current Devnet demonstrates that these components can be made concrete
+enough to test: canonical encoding, network-bound signatures, exact v2
+arithmetic, chain-derived targets, cumulative-work reorganization, durable
+replay, deterministic mempool behavior, real fee burning, channel settlement
+accounting, miner UTXO consolidation, and pinned-TLS nonce-only pool shares with
+server recomputation all execute today at research scale.
 
-The most important work is unfinished. Production needs a transparent succinct proof for the entire 384-layer relation, a published and linked seedless model bank, a sound final-digest construction, optimized independent miners and provers, evidence across low- and high-memory hardware, public-network hardening, secure custody, marketplace transport, governance disclosure, and external audits.
+The most important work is unfinished. Production needs a transparent succinct
+proof for the entire 384-layer relation, a published and linked seedless model
+bank, a sound final-digest construction, optimized independent miners and
+provers, evidence across low- and high-memory hardware, public-network
+hardening, secure custody, durable pool payouts and share-proof DoS defenses,
+marketplace transport, governance disclosure, and external audits.
 
 That honesty is part of the design. Common Foundry should become valuable only after its central claims are independently demonstrated, not because a white paper treats proposals as facts.
 
@@ -931,6 +1038,14 @@ That honesty is part of the design. Common Foundry should become valuable only a
 | Ledger | Inputs/outputs per transaction | 128 / 128 |
 | Ledger | Signature checks per block | 2,048 |
 | Devnet PoW | V2 batch/dimension/layers | 2 / 4 / 4 |
+| Devnet pool | Protocol / transport | CMFD pool v1 / TLS 1.3, exact leaf pin |
+| Devnet pool | Default address | `127.0.0.1:18445` |
+| Devnet pool | Maximum framed message | 16 KiB |
+| Devnet pool | Connections / messages per session | 64 / 1,000,000 |
+| Devnet pool | Valid nonce records per job | 65,536 |
+| Devnet pool | Recent session / payout-label records | 1,024 / 1,024 |
+| Devnet pool | Default share threshold | 7 leading zero bits |
+| Devnet pool | Accounting | Bounded in-memory test counters; no payout |
 | Proposed PoW | V2 batch/dimension/layers | 128 / 4,096 / 384 |
 | Proposed PoW | Raw model bank | 6 GiB weights + 512 KiB base + 184-byte header |
 | Proposed proof | Aggregate soundness | At least 128 bits |
@@ -954,6 +1069,7 @@ Most protocol hashes are domain-separated. Two specified exceptions are the plai
 - proof transcript;
 - node storage-record checksums;
 - network consensus fingerprint;
+- Devnet pool job identifiers;
 - inference channel identifiers, states, receipts, and transaction-contained settlement or refund paths.
 
 Every challenge-dependent proof step must absorb the public inputs, prior commitments, the current claim, and the prover message before deriving its next challenge. Network identity must be present inside canonical objects, not inferred solely from a short transport magic.
@@ -1021,7 +1137,7 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, release `v0.1.0-devnet.1`, commit `e81de049f618ab14d61dd72162430f5178cb1eef`.
+10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.2`; the annotated Git tag identifies the exact source commit.
 
 ## Appendix F. Non-claims
 
@@ -1037,6 +1153,8 @@ For avoidance of doubt, this paper does not claim that:
 - the CUDA fixture is an optimized miner or prover, or independently rederives the BLAKE3 challenge-to-mask coefficients;
 - the 6 GiB model is mathematically incompressible;
 - inference receipts prove model correctness;
+- Devnet pool credits are spendable rewards, a debt, or an on-chain balance;
+- the pinned pool server certificate authenticates workers or Devnet P2P peers;
 - the steward or community destinations are decentralized merely because they are named funds;
 - the private Devnet, shared wallet key, or unsigned prerelease is suitable for value;
 - mainnet is ready.

@@ -1,6 +1,6 @@
 import { Blocks, Check, Clipboard, Hammer, RefreshCw, ServerCog, ShieldAlert } from "lucide-react";
 import { useState } from "react";
-import { mineDevnetBlock } from "../api/nodeClient";
+import { mineDevnetBlock, usesEmbeddedNode } from "../api/nodeClient";
 import { formatBytes, shortenHash } from "../lib/amount";
 import type { MempoolSnapshot, NodeStatus, WalletSnapshot } from "../types";
 
@@ -32,9 +32,15 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
     try {
       const result = await mineDevnetBlock(wallet.destination);
       onNotice(`Block ${result.height} forged and accepted.`);
-      await onRefresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Mining attempt failed");
+      setMining(false);
+      return;
+    }
+    try {
+      await onRefresh();
+    } catch {
+      // The accepted block remains successful even if the best-effort refresh fails.
     } finally {
       setMining(false);
     }
@@ -63,7 +69,9 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
           <span className="service-icon"><ServerCog aria-hidden="true" size={21} /></span>
           <div>
             <strong>{status ? "Node connected" : "Node unavailable"}</strong>
-            <span>{status ? "Loopback RPC is responding" : "Start the local Devnet node, then refresh"}</span>
+            <span>{status
+              ? (usesEmbeddedNode ? "Embedded Rust node is responding" : "Loopback RPC is responding")
+              : (usesEmbeddedNode ? "Embedded node failed to start; retry or reopen the wallet" : "Start the local Devnet node, then refresh")}</span>
           </div>
           <span className={`service-state${status ? " is-online" : ""}`}>{status ? "Online" : "Offline"}</span>
         </div>

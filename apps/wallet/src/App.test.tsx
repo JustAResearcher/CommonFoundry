@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -136,5 +136,20 @@ describe("Common Foundry wallet", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.getByText("177.50000000")).toBeInTheDocument());
+  });
+
+  it("opens the dedicated Mining page from wallet navigation", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("177.50000000");
+
+    await user.click(screen.getAllByRole("button", { name: "Mining" })[0]);
+    expect(screen.getByRole("heading", { name: "Mining", level: 1 })).toBeInTheDocument();
+    expect(screen.getByText("ForgeMatrix mining")).toBeInTheDocument();
+    expect(screen.getByText("matrix attempts/s")).toBeInTheDocument();
+
+    const mobileNavigation = screen.getAllByRole("navigation", { name: "Wallet navigation" })[1];
+    expect(within(mobileNavigation).getByRole("button", { name: "Mining" })).toBeInTheDocument();
+    expect(within(mobileNavigation).queryByRole("button", { name: "Network" })).not.toBeInTheDocument();
   });
 });

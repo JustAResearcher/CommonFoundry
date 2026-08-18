@@ -200,6 +200,21 @@ impl ForgeMatrixVerifier {
         block: &BlockChallenge,
         proof: &ForgeMatrixProof,
     ) -> Result<WorkStats, ForgeMatrixError> {
+        let stats = self.verify_relation(block, proof)?;
+        if !meets_target(&proof.work_digest, &block.target) {
+            return Err(ForgeMatrixError::HighHash);
+        }
+        Ok(stats)
+    }
+
+    /// Recomputes the complete committed ForgeMatrix relation without
+    /// interpreting any proof target. Consensus callers must still use
+    /// [`Self::verify`] when deciding whether a block is valid.
+    pub(crate) fn verify_relation(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixProof,
+    ) -> Result<WorkStats, ForgeMatrixError> {
         if proof.algorithm_version != self.profile.algorithm_version {
             return Err(ForgeMatrixError::AlgorithmVersion);
         }
@@ -216,9 +231,6 @@ impl ForgeMatrixVerifier {
         }
         if proof.work_digest != expected.work_digest {
             return Err(ForgeMatrixError::WorkDigest);
-        }
-        if !meets_target(&proof.work_digest, &block.target) {
-            return Err(ForgeMatrixError::HighHash);
         }
         Ok(expected.stats)
     }

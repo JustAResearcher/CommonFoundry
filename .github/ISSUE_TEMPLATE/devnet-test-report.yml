@@ -1,0 +1,76 @@
+name: Devnet test report
+description: Record a successful or unsuccessful wallet, node, mining, or synchronization test.
+title: "[Devnet test]: "
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Release
+      placeholder: v0.1.0-devnet.2
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Test environment
+      description: Include OS/version, CPU, GPU, RAM, artifact type, and SHA-256.
+    validations:
+      required: true
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Topology
+      options:
+        - Single wallet or node
+        - Two local nodes
+        - Three local nodes
+        - Private-LAN peers
+        - Private-VPN peers
+        - Wallet connected to a Devnet pool
+    validations:
+      required: true
+  - type: checkboxes
+    id: operations
+    attributes:
+      label: Operations exercised
+      options:
+        - label: Fresh installation or extraction
+        - label: Initial startup and shutdown
+        - label: Restart and persistent-chain replay
+        - label: Peer synchronization
+        - label: Solo mining
+        - label: Pool share submission
+        - label: Wallet receive and balance display
+        - label: Transaction send and fee burn
+        - label: Coinbase maturity
+        - label: UTXO consolidation
+        - label: Reorganization or competing branches
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - Pass
+        - Pass with observations
+        - Fail
+    validations:
+      required: true
+  - type: textarea
+    id: observations
+    attributes:
+      label: Results and observations
+      description: Include heights, peer behavior, rates, errors, and exact reproduction details. Devnet rates are matrix evaluations per second, not production GPU hashrate.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized evidence
+      description: Attach relevant output after removing keys, credentials, public IP addresses, and personal paths.
+  - type: checkboxes
+    id: notice
+    attributes:
+      label: Devnet confirmation
+      options:
+        - label: I understand Devnet coins and pool credits are valueless test data.
+          required: true

@@ -338,6 +338,21 @@ impl ForgeMatrixV2Reference {
         block: &BlockChallenge,
         proof: &ForgeMatrixV2CompactProof,
     ) -> Result<(), ForgeMatrixV2Error> {
+        self.verify_compact_relation(block, proof)?;
+        if proof.work_digest > block.target {
+            return Err(ForgeMatrixV2Error::HighHash);
+        }
+        Ok(())
+    }
+
+    /// Recomputes every matrix layer and committed digest without applying a
+    /// target. Consensus callers must still use [`Self::verify_compact`] for
+    /// block validation.
+    pub(crate) fn verify_compact_relation(
+        &self,
+        block: &BlockChallenge,
+        proof: &ForgeMatrixV2CompactProof,
+    ) -> Result<(), ForgeMatrixV2Error> {
         if block.network_id != self.descriptor.network_id {
             return Err(ForgeMatrixV2Error::WrongNetwork);
         }
@@ -360,9 +375,6 @@ impl ForgeMatrixV2Reference {
         }
         if proof.work_digest != expected.work_digest {
             return Err(ForgeMatrixV2Error::WorkDigest);
-        }
-        if expected.work_digest > block.target {
-            return Err(ForgeMatrixV2Error::HighHash);
         }
         Ok(())
     }
