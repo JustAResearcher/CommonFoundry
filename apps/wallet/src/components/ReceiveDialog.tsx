@@ -99,7 +99,7 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
         </div>
 
         <p className="dialog-description" id="receive-dialog-description">
-          Mine or receive valueless test CMFD to this x-only public key.
+          Mine or receive Devnet CMFD at this x-only public key.
         </p>
 
         {address ? (
@@ -128,9 +128,9 @@ export function ReceiveDialog({ open, wallet, onClose }: ReceiveDialogProps) {
         )}
 
         <div className="warning-panel" role="note">
-          <strong className="warning-title">Devnet-0 only · Unencrypted test wallet</strong>
+          <strong className="warning-title">Devnet-0 test wallet</strong>
           <span className="warning-copy">
-            {wallet?.warning ?? "This test wallet is unavailable. Never send real value."}
+            {wallet?.warning ?? "This test wallet is currently unavailable."}
           </span>
         </div>
 

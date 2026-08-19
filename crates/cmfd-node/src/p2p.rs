@@ -11,7 +11,7 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cmfd_consensus::{Block, Transaction, WireError, decode_block};
 use thiserror::Error;
@@ -20,7 +20,7 @@ use crate::peer::{
     PeerAddressPolicy, PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
     StaticPeerConfig,
 };
-use crate::{Node, NodeError, unix_time_seconds};
+use crate::{Node, NodeError, PeerDirection, unix_time_seconds};
 
 /// One request is deliberately small enough that sixteen maximum-size blocks,
 /// sixty-four maximum-size transactions, their outer peer frames, and
@@ -131,6 +131,43 @@ fn sync_from_peer_once_inner(
 }
 
 fn sync_from_peer_once_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<SyncReport, P2pError> {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    record_peer_started(
+        &shared,
+        PeerDirection::Outbound,
+        observation_address.clone(),
+    );
+    let result = perform_sync_from_peer_once_inner_with_policy(
+        Arc::clone(&shared),
+        address,
+        limits,
+        address_policy,
+        nonce_override,
+    );
+    if let Ok(report) = &result {
+        record_peer_succeeded(
+            &shared,
+            PeerDirection::Outbound,
+            observation_address.clone(),
+            report.remote_hello,
+        );
+    }
+    record_peer_ended(
+        &shared,
+        PeerDirection::Outbound,
+        observation_address,
+        result.is_err(),
+    );
+    result
+}
+
+fn perform_sync_from_peer_once_inner_with_policy(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,
     limits: PeerLimits,
@@ -308,6 +345,34 @@ fn respond_to_peer_inner_with_policy(
     address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
+    let remote_address = stream.peer_addr().map_err(P2pError::ListenerIo)?;
+    let observation_address = observed_address(PeerDirection::Inbound, remote_address);
+    record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());
+    let result = perform_respond_to_peer_inner_with_policy(
+        Arc::clone(&shared),
+        stream,
+        limits,
+        address_policy,
+        nonce_override,
+        observation_address.clone(),
+    );
+    record_peer_ended(
+        &shared,
+        PeerDirection::Inbound,
+        observation_address,
+        result.is_err(),
+    );
+    result
+}
+
+fn perform_respond_to_peer_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    stream: TcpStream,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+    observation_address: String,
+) -> Result<(), P2pError> {
     let hello = with_nonce(
         {
             let node = lock_node(&shared)?;
@@ -319,7 +384,13 @@ fn respond_to_peer_inner_with_policy(
     let session = PeerSession::new(hello, limits)?;
     let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
     connection.send_hello()?;
-    expect_hello(connection.receive()?)?;
+    let remote_hello = expect_hello(connection.receive()?)?;
+    record_peer_succeeded(
+        &shared,
+        PeerDirection::Inbound,
+        observation_address,
+        remote_hello,
+    );
 
     loop {
         let message = match connection.receive() {
@@ -383,6 +454,54 @@ fn respond_to_peer_inner_with_policy(
                 });
             }
         }
+    }
+}
+
+fn observed_address(direction: PeerDirection, address: SocketAddr) -> String {
+    match direction {
+        PeerDirection::Inbound => address.ip().to_string(),
+        PeerDirection::Outbound => address.to_string(),
+    }
+}
+
+fn observation_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn record_peer_started(shared: &Arc<Mutex<Node>>, direction: PeerDirection, address: String) {
+    if let Ok(mut node) = shared.lock() {
+        node.record_peer_started(direction, address, observation_time());
+    }
+}
+
+fn record_peer_succeeded(
+    shared: &Arc<Mutex<Node>>,
+    direction: PeerDirection,
+    address: String,
+    remote_hello: PeerHello,
+) {
+    if let Ok(mut node) = shared.lock() {
+        node.record_peer_succeeded(
+            direction,
+            address,
+            remote_hello.height,
+            remote_hello.tip,
+            observation_time(),
+        );
+    }
+}
+
+fn record_peer_ended(
+    shared: &Arc<Mutex<Node>>,
+    direction: PeerDirection,
+    address: String,
+    failed: bool,
+) {
+    if let Ok(mut node) = shared.lock() {
+        node.record_peer_ended(direction, address, failed, observation_time());
     }
 }
 
@@ -932,6 +1051,42 @@ mod tests {
         assert!(second.up_to_date());
         assert_eq!(second.requested_blocks, 0);
         assert_eq!(second.accepted_blocks, 0);
+
+        let target_status = target.lock().unwrap().status().unwrap();
+        assert_eq!(target_status.peers.len(), 1);
+        let outbound = &target_status.peers[0];
+        assert_eq!(outbound.address, address.to_string());
+        assert_eq!(outbound.direction, PeerDirection::Outbound);
+        assert_eq!(outbound.state, crate::PeerState::Reachable);
+        assert_eq!(outbound.successful_sessions, 2);
+        assert_eq!(outbound.failed_sessions, 0);
+        assert_eq!(outbound.active_connections, 0);
+        assert_eq!(outbound.remote_height, Some(3));
+        assert_eq!(outbound.remote_tip, Some(target_status.tip.clone()));
+
+        let inbound = (0..100).find_map(|_| {
+            let peer = source
+                .lock()
+                .unwrap()
+                .status()
+                .unwrap()
+                .peers
+                .into_iter()
+                .find(|peer| {
+                    peer.direction == PeerDirection::Inbound
+                        && peer.successful_sessions == 2
+                        && peer.active_connections == 0
+                });
+            if peer.is_none() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            peer
+        });
+        let inbound = inbound.expect("inbound peer observation");
+        assert_eq!(inbound.address, address.ip().to_string());
+        assert_eq!(inbound.state, crate::PeerState::Reachable);
+        assert_eq!(inbound.remote_height, Some(3));
+        assert_eq!(inbound.remote_tip, Some(target_status.tip));
 
         listener.stop().unwrap();
         drop(source);

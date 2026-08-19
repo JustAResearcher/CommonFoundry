@@ -230,7 +230,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               </div>
               <div className="warning-inline pool-credit-note" role="note">
                 <ShieldAlert aria-hidden="true" size={17} />
-                <span>Credits are session-only, valueless, and non-withdrawable. Payout labels are unauthenticated and the Devnet pool has no payout mechanism.</span>
+                <span>Pool credits are session statistics for testing; payouts are not enabled yet.</span>
               </div>
             </>
           ) : (
@@ -260,7 +260,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
                 <strong>{cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine"}</strong>
                 <p>{cudaActive
                   ? `Runs the Devnet ForgeMatrix-v2 matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
-                  : "Runs the tiny ForgeMatrix-v2 full-recompute profile for private Devnet testing."}</p>
+                  : "Runs the tiny ForgeMatrix-v2 full-recompute profile for Devnet testing."}</p>
               </div>
             </div>
             <div>
@@ -419,8 +419,8 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           {buttonText}
         </button>
         <small>{poolSelected
-          ? `Private Devnet-0 only · session accounting only · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
-          : `Private Devnet-0 only · valueless funds · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
+          ? `Devnet-0 · pool session statistics · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
+          : `Devnet-0 · solo mining · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
       </aside>
     </div>
   );

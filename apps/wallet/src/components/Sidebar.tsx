@@ -69,8 +69,8 @@ export function Sidebar({ active, onNavigate, onSend, onReceive }: SidebarProps)
       <div className="sidebar-network">
         <span className="network-dot" />
         <div>
-          <strong>Private Devnet-0</strong>
-          <span>No real-world value</span>
+          <strong>Devnet-0</strong>
+          <span>Community testing</span>
         </div>
       </div>
     </aside>

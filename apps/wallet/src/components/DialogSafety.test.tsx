@@ -81,7 +81,7 @@ describe("wallet dialog safety", () => {
   it("keeps the active send field focused across parent polling renders", async () => {
     const user = userEvent.setup();
     const view = render(<App />);
-    await screen.findByText("125.00000123");
+    await screen.findByText("125.00");
 
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
     const amount = screen.getByRole("textbox", { name: "Amount" });
@@ -110,7 +110,7 @@ describe("wallet dialog safety", () => {
 
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("125.00000123");
+    await screen.findByText("125.00");
     await user.click(screen.getAllByRole("button", { name: "Send" })[0]);
     await user.type(screen.getByRole("textbox", { name: "Recipient" }), destination);
     await user.type(screen.getByRole("textbox", { name: "Amount" }), "1");
@@ -163,7 +163,7 @@ describe("wallet dialog safety", () => {
 
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("125.00000123");
+    await screen.findByText("125.00");
     await user.click(screen.getAllByRole("button", { name: "Transactions" })[0]);
     await user.click(screen.getByRole("button", { name: "Consolidate outputs" }));
     await user.click(screen.getByRole("button", { name: "Review consolidation" }));

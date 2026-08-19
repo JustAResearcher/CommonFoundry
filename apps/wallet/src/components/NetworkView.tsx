@@ -1,4 +1,4 @@
-import { Blocks, Check, Clipboard, Hammer, RefreshCw, ServerCog, ShieldAlert } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, Blocks, Check, Clipboard, Hammer, RefreshCw, ServerCog, ShieldAlert } from "lucide-react";
 import { useState } from "react";
 import { mineDevnetBlock, usesEmbeddedNode } from "../api/nodeClient";
 import { formatBytes, shortenHash } from "../lib/amount";
@@ -17,6 +17,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
   const [mining, setMining] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const peers = status?.peers ?? [];
 
   const copyDiagnostics = async () => {
     if (!status) return;
@@ -77,9 +78,9 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         </div>
 
         {status?.public_peer_mode ? (
-          <div className="warning-inline" role="alert">
+          <div className="warning-inline" role="status">
             <ShieldAlert aria-hidden="true" size={17} />
-            <span>Public Devnet P2P is enabled. It is unauthenticated and unencrypted; keep RPC on loopback and expect hostile traffic.</span>
+            <span>Public Devnet P2P is enabled. Node RPC remains local to this computer.</span>
           </div>
         ) : null}
 
@@ -97,6 +98,54 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
           <Diagnostic label="Network ID" value={status ? shortenHash(status.network_id, 10, 10) : "—"} mono title={status?.network_id} />
           <Diagnostic label="Consensus fingerprint" value={status ? shortenHash(status.consensus_fingerprint, 10, 10) : "—"} mono title={status?.consensus_fingerprint} />
         </dl>
+
+        <section className="peer-panel" aria-labelledby="recent-peers-heading">
+          <div className="peer-panel-heading">
+            <div>
+              <span>Peer activity</span>
+              <h3 id="recent-peers-heading">Recent peers</h3>
+            </div>
+            <span className="peer-count">{peers.length}</span>
+          </div>
+          <p className="peer-panel-help">
+            Short P2P sessions are retained here and update with node diagnostics.
+          </p>
+          {peers.length === 0 ? (
+            <div className="peer-empty">
+              <ServerCog aria-hidden="true" size={20} />
+              <div>
+                <strong>No peer sessions observed yet</strong>
+                <span>Configured and inbound peers appear after their first connection attempt.</span>
+              </div>
+            </div>
+          ) : (
+            <ul className="peer-list">
+              {peers.map((peer) => (
+                <li className="peer-row" key={`${peer.direction}:${peer.address}`}>
+                  <span className={`peer-direction peer-direction-${peer.direction}`} aria-hidden="true">
+                    {peer.direction === "inbound" ? <ArrowDownToLine size={16} /> : <ArrowUpFromLine size={16} />}
+                  </span>
+                  <div className="peer-identity">
+                    <code>{peer.address}</code>
+                    <span>{capitalize(peer.direction)} · first seen {formatPeerAge(peer.first_seen)}</span>
+                  </div>
+                  <div className="peer-chain">
+                    <strong>{peer.remote_height === null ? "Height unknown" : `Height ${peer.remote_height.toLocaleString()}`}</strong>
+                    <span title={peer.remote_tip ?? undefined}>{peer.remote_tip ? shortenHash(peer.remote_tip, 7, 7) : "No compatible handshake yet"}</span>
+                  </div>
+                  <div className="peer-sessions">
+                    <strong>{peer.successful_sessions.toLocaleString()} successful</strong>
+                    <span>{peer.failed_sessions.toLocaleString()} failed</span>
+                  </div>
+                  <div className="peer-status-cell">
+                    <span className={`peer-state peer-state-${peer.state}`}>{peerStateLabel(peer.state)}</span>
+                    <small>{peer.active_connections > 0 ? `${peer.active_connections} active` : formatPeerAge(peer.last_seen)}</small>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       </section>
 
       <aside className="forge-card">
@@ -110,7 +159,7 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
         </div>
         <div className="warning-inline">
           <ShieldAlert aria-hidden="true" size={17} />
-          <span>This unencrypted test key is only for valueless private Devnet testing.</span>
+          <span>This reward destination belongs to your local Devnet test wallet.</span>
         </div>
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         <button className="button-primary wide" type="button" disabled={!wallet || mining} onClick={() => void mine()}>
@@ -121,6 +170,27 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
       </aside>
     </div>
   );
+}
+
+function peerStateLabel(state: "connected" | "reachable" | "failed") {
+  if (state === "connected") return "Connected";
+  if (state === "reachable") return "Reachable";
+  return "Failed";
+}
+
+function capitalize(value: "inbound" | "outbound") {
+  return value === "inbound" ? "Inbound" : "Outbound";
+}
+
+function formatPeerAge(timestamp: number) {
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1_000) - timestamp);
+  if (elapsed < 5) return "just now";
+  if (elapsed < 60) return `${elapsed}s ago`;
+  const minutes = Math.floor(elapsed / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 function Diagnostic({ label, value, mono = false, good = false, title }: { label: string; value: string; mono?: boolean; good?: boolean; title?: string }) {

@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "cmfd-node"
-version = "0.1.0-devnet.4"
+version = "0.1.0-devnet.5"
 dependencies = [
  "blake3",
  "clap",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "common-foundry-wallet"
-version = "0.1.0-devnet.4"
+version = "0.1.0-devnet.5"
 dependencies = [
  "cmfd-consensus",
  "cmfd-node",

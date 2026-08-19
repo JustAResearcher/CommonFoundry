@@ -95,17 +95,17 @@ describe("Common Foundry wallet", () => {
   it("renders live wallet and node values without inventing market data", async () => {
     render(<App />);
 
-    expect(await screen.findByText("177.50000000")).toBeInTheDocument();
+    expect(await screen.findByText("177.50")).toBeInTheDocument();
     expect(screen.getByText("Block height").nextElementSibling).toHaveTextContent("128");
     expect(screen.getByText("Mined reward")).toBeInTheDocument();
-    expect(screen.getByText(/Valueless test funds/)).toBeInTheDocument();
+    expect(screen.getByText(/Testing network/)).toBeInTheDocument();
     expect(screen.queryByText(/USD|market price|sync percentage/i)).not.toBeInTheDocument();
   });
 
   it("exposes consolidation from Transactions with mature-output safeguards", async () => {
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("177.50000000");
+    await screen.findByText("177.50");
 
     await user.click(screen.getAllByRole("button", { name: "Transactions" })[0]);
     expect(screen.getByRole("heading", { name: "Consolidate mining outputs" })).toBeInTheDocument();
@@ -120,7 +120,7 @@ describe("Common Foundry wallet", () => {
   it("opens the receive address without exposing private key material", async () => {
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("177.50000000");
+    await screen.findByText("177.50");
 
     await user.click(screen.getAllByRole("button", { name: "Receive" })[0]);
     expect(screen.getByRole("dialog", { name: "Receive CMFD" })).toBeInTheDocument();
@@ -135,13 +135,13 @@ describe("Common Foundry wallet", () => {
     expect(await screen.findByText("Local node unavailable")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(screen.getByText("177.50000000")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("177.50")).toBeInTheDocument());
   });
 
   it("opens the dedicated Mining page from wallet navigation", async () => {
     const user = userEvent.setup();
     render(<App />);
-    await screen.findByText("177.50000000");
+    await screen.findByText("177.50");
 
     await user.click(screen.getAllByRole("button", { name: "Mining" })[0]);
     expect(screen.getByRole("heading", { name: "Mining", level: 1 })).toBeInTheDocument();

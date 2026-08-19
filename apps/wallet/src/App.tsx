@@ -68,7 +68,7 @@ export function App() {
 
         <div className="devnet-warning" role="note">
           <AlertTriangle aria-hidden="true" size={16} />
-          <span><strong>Private Devnet-0</strong> · Valueless test funds · Unencrypted test wallet</span>
+          <span><strong>Common Foundry Devnet-0</strong> · Testing network · No monetary value</span>
         </div>
 
         {data.error ? (

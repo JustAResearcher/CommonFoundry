@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAtoms, parseCmfd, shortenHash, sumAtoms } from "./amount";
+import { formatAtoms, formatBalanceAtoms, parseCmfd, shortenHash, sumAtoms } from "./amount";
 
 describe("CMFD amount helpers", () => {
   it("parses and formats exact eight-decimal values", () => {
@@ -9,9 +9,16 @@ describe("CMFD amount helpers", () => {
     expect(formatAtoms(1n, true)).toBe("+0.00000001");
   });
 
+  it("rounds wallet balance displays to two decimals", () => {
+    expect(formatBalanceAtoms(125_000_001n)).toBe("1.25");
+    expect(formatBalanceAtoms(125_500_001n)).toBe("1.26");
+    expect(formatBalanceAtoms(-1n)).toBe("0.00");
+  });
+
   it("preserves values above JavaScript's safe integer range", () => {
     const atoms = "18446744073709551615";
     expect(formatAtoms(atoms)).toBe("184,467,440,737.09551615");
+    expect(formatBalanceAtoms(atoms)).toBe("184,467,440,737.10");
     expect(sumAtoms(atoms, "1")).toBe(18_446_744_073_709_551_616n);
   });
 

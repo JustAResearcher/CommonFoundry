@@ -101,11 +101,12 @@ block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
 
-For a small direct-IP test network, forward TCP `18444` on one router to the
-node's private LAN address, start that hub with `--allow-public-peers`, and have
-testers add `--allow-public-peers --peer PUBLIC_IP:18444`. Never forward RPC
-port `18443`. Public P2P remains unauthenticated and unencrypted, with no peer
-discovery, ban system, or demonstrated DDoS resistance.
+The community Devnet bootstrap is currently `107.214.187.2:18444`. Testers can
+join it by starting the wallet with
+`--allow-public-peers --peer 107.214.187.2:18444`. This is a best-effort testing
+endpoint rather than automatic discovery; node RPC remains local and is not
+published. Operators can also run a private direct-IP topology as documented
+in [docs/devnet-0.md](docs/devnet-0.md).
 
 ### Local Devnet wallet
 
@@ -189,21 +190,17 @@ See [docs/devnet-0.md](docs/devnet-0.md) for the full pool boundary and
 [apps/wallet/src-tauri/README.md](apps/wallet/src-tauri/README.md) for desktop
 static-peer command-line options.
 
-Each new data directory creates a distinct unencrypted Schnorr test key in
-`wallet.key`; the node never returns its private bytes through RPC or desktop
-IPC. Stop the node before backing up that file and never share it. An existing
-nonempty Devnet-2 directory retains the old public demonstration key during
-migration so an upgrade cannot strand its test outputs. The interface and
-funds remain private, valueless Devnet-0 test tools: there is no encryption,
-mnemonic recovery, hardware-wallet support, or production custody, and the
-wallet must never receive real value.
+Each new data directory creates a distinct Schnorr test key in `wallet.key`;
+the node never returns its private bytes through RPC or desktop IPC. Stop the
+node before backing up that file and do not share it. An existing nonempty
+Devnet-2 directory retains its original demonstration key during migration so
+an upgrade cannot strand its test outputs.
 
-This is not a public testnet. It has no peer discovery, peer identity
-authentication, encrypted P2P transport, NAT traversal, production wallet/key
-custody, durable pool payout system, or optimized GPU miner. Extending a side
-branch currently replays it from genesis, which is intentionally Devnet-only
-and does not scale. See [docs/devnet-0.md](docs/devnet-0.md) for exact node and
-pool commands, RPC examples, acceptance checks, and operating limits.
+Devnet-0 is the active Common Foundry testing network. It currently uses
+manually configured peers rather than automatic discovery. See
+[docs/devnet-0.md](docs/devnet-0.md) for node and pool commands, RPC examples,
+acceptance checks, and operating limits; detailed protocol limitations remain
+in [SECURITY.md](SECURITY.md).
 
 See [docs/consensus/forgematrix-v1.md](docs/consensus/forgematrix-v1.md), the
 [recommended v2 research specification](docs/consensus/forgematrix-v2.md), and

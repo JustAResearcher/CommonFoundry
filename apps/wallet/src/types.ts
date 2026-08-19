@@ -1,5 +1,19 @@
 export type WalletHistoryKind = "mined" | "received" | "sent" | "consolidated";
 
+export interface PeerObservation {
+  address: string;
+  direction: "inbound" | "outbound";
+  state: "connected" | "reachable" | "failed";
+  first_seen: number;
+  last_seen: number;
+  last_success: number | null;
+  successful_sessions: number;
+  failed_sessions: number;
+  active_connections: number;
+  remote_height: number | null;
+  remote_tip: string | null;
+}
+
 export interface NodeStatus {
   network: string;
   network_id: string;
@@ -15,6 +29,7 @@ export interface NodeStatus {
   mempool_bytes: number;
   storage_healthy: boolean;
   public_peer_mode: boolean;
+  peers: PeerObservation[];
 }
 
 export interface WalletBalances {

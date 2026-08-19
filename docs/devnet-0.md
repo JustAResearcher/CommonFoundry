@@ -119,6 +119,12 @@ TOPS, and the software does not prove physical GPU or VRAM use. See
 [ForgeMatrix v2 CUDA miner](cuda-miner.md). Transaction fees are burned. Mined rewards remain immature for 100 confirmations and cannot be
 spent or consolidated before then.
 
+The Overview displays wallet balances rounded to two decimal places while
+transaction construction and confirmation retain the full eight-decimal atom
+precision. The Network page shows recent inbound and outbound peer sessions,
+their reported heights and tips, reachability, and success/failure counts. Peer
+observations are bounded runtime telemetry and reset when the node restarts.
+
 The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the
 exact form `cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX` and a worker name matching
 `[A-Za-z0-9._-]{1,32}`. The endpoint must be a numeric loopback, RFC1918 IPv4,
@@ -299,8 +305,19 @@ configured to poll a source directly or through another polling node.
 
 ## Run a small direct-IP test network
 
-This is the simplest Windows-hub/Linux-tester layout. It is opt-in because P2P
-is unauthenticated and unencrypted.
+This is the simplest Windows-hub/Linux-tester layout. Public connections use
+the explicit `--allow-public-peers` option.
+
+For the community Devnet, the current bootstrap endpoint is:
+
+```text
+107.214.187.2:18444
+```
+
+Start a packaged wallet with
+`--allow-public-peers --peer 107.214.187.2:18444` to follow it. The endpoint is
+best-effort and may change between Devnet releases; the release announcement
+and community test issue are the authoritative current values.
 
 1. On the Windows router, forward **TCP 18444 only** to the Windows computer's
    private LAN address. Do not forward RPC port 18443.

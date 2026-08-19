@@ -7,7 +7,7 @@ import {
   RefreshCw,
   WalletCards,
 } from "lucide-react";
-import { formatAtoms, formatBytes, shortenHash, sumAtoms } from "../lib/amount";
+import { formatBalanceAtoms, formatBytes, shortenHash, sumAtoms } from "../lib/amount";
 import type { NodeStatus, WalletSnapshot } from "../types";
 import { TransactionList } from "./TransactionList";
 
@@ -46,21 +46,21 @@ export function Overview({
         </div>
         <div className="total-balance">
           <span>Total balance</span>
-          <strong>{wallet ? formatAtoms(total) : "—"}</strong>
+          <strong>{wallet ? formatBalanceAtoms(total) : "—"}</strong>
           <em>CMFD</em>
         </div>
         <div className="balance-breakdown">
           <div>
             <span>Available</span>
-            <strong>{balances ? formatAtoms(balances.spendable_atoms) : "—"}</strong>
+            <strong>{balances ? formatBalanceAtoms(balances.spendable_atoms) : "—"}</strong>
           </div>
           <div>
             <span>Pending</span>
-            <strong>{balances ? formatAtoms(balances.pending_atoms) : "—"}</strong>
+            <strong>{balances ? formatBalanceAtoms(balances.pending_atoms) : "—"}</strong>
           </div>
           <div>
             <span>Immature</span>
-            <strong>{balances ? formatAtoms(balances.immature_atoms) : "—"}</strong>
+            <strong>{balances ? formatBalanceAtoms(balances.immature_atoms) : "—"}</strong>
           </div>
         </div>
         <div className="balance-actions">

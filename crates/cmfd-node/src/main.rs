@@ -283,8 +283,8 @@ fn peer_address_policy(allow_public_peers: bool) -> PeerAddressPolicy {
 
 fn peer_warning(allow_public_peers: bool) -> &'static str {
     if allow_public_peers {
-        "PUBLIC DEVNET P2P ENABLED: transport is unauthenticated and unencrypted; expose only TCP P2P, keep RPC on loopback, and expect hostile traffic"
+        "Public Devnet P2P enabled; node RPC remains on loopback"
     } else {
-        "private, valueless Devnet-0; peer compatibility is not identity authentication or encryption"
+        "Common Foundry Devnet-0 testing network"
     }
 }

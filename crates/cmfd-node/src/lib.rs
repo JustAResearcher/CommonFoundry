@@ -44,6 +44,7 @@ pub const MAX_MEMPOOL_TRANSACTIONS: usize = 1_024;
 pub const MAX_MEMPOOL_BYTES: usize = 512 * 1024;
 pub const MIN_RELAY_FEE_PER_KIB: u64 = 1;
 pub const MAX_WALLET_HISTORY: usize = 100;
+pub const MAX_OBSERVED_PEERS: usize = 64;
 
 const METADATA_FILE: &str = "network.meta";
 const BLOCK_LOG_FILE: &str = "blocks.log";
@@ -63,8 +64,9 @@ const RPC_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TOTAL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const WALLET_JSON_BODY_LIMIT: usize = 2 * 1024;
-const LEGACY_DEV_WALLET_WARNING: &str = "INSECURE DEVNET-0 LEGACY WALLET: this existing data directory retains the public demonstration key so an upgrade does not strand its test coins. These coins are valueless and this wallet must never be used on a production network.";
-const LOCAL_DEV_WALLET_WARNING: &str = "DEVNET-0 TEST WALLET: this data directory has a unique, unencrypted local private key. Back up wallet.key before testing recovery. These coins are valueless and this wallet must never be used on a production network.";
+const LEGACY_DEV_WALLET_WARNING: &str = "Devnet-0 legacy wallet: this upgraded data directory retains its original demonstration key so existing test coins remain available.";
+const LOCAL_DEV_WALLET_WARNING: &str =
+    "Devnet-0 test wallet: back up wallet.key if you want to test wallet recovery.";
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -252,6 +254,56 @@ pub struct NodeStatus {
     pub mempool_bytes: usize,
     pub storage_healthy: bool,
     pub public_peer_mode: bool,
+    pub peers: Vec<PeerObservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerState {
+    Connected,
+    Reachable,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PeerObservation {
+    pub address: String,
+    pub direction: PeerDirection,
+    pub state: PeerState,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub last_success: Option<u64>,
+    pub successful_sessions: u64,
+    pub failed_sessions: u64,
+    pub active_connections: usize,
+    pub remote_height: Option<u64>,
+    pub remote_tip: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PeerObservationKey {
+    direction: PeerDirection,
+    address: String,
+}
+
+#[derive(Debug, Clone)]
+struct PeerObservationRecord {
+    first_seen: u64,
+    last_seen: u64,
+    last_success: Option<u64>,
+    last_attempt_succeeded: bool,
+    successful_sessions: u64,
+    failed_sessions: u64,
+    active_connections: usize,
+    remote_height: Option<u64>,
+    remote_tip: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone)]
@@ -761,6 +813,7 @@ pub struct Node {
     log: File,
     storage_faulted: bool,
     public_peer_mode: bool,
+    peer_observations: BTreeMap<PeerObservationKey, PeerObservationRecord>,
     _lock: DataDirLock,
 }
 
@@ -952,6 +1005,7 @@ impl Node {
             log,
             storage_faulted: false,
             public_peer_mode: false,
+            peer_observations: BTreeMap::new(),
             _lock: lock,
         })
     }
@@ -992,7 +1046,133 @@ impl Node {
             mempool_bytes: self.mempool_bytes,
             storage_healthy: !self.storage_faulted,
             public_peer_mode: self.public_peer_mode,
+            peers: self.peer_observations(),
         })
+    }
+
+    pub(crate) fn record_peer_started(
+        &mut self,
+        direction: PeerDirection,
+        address: String,
+        now: u64,
+    ) {
+        let Some(record) = self.peer_observation_mut(direction, address, now) else {
+            return;
+        };
+        record.last_seen = now;
+        record.active_connections = record.active_connections.saturating_add(1);
+    }
+
+    pub(crate) fn record_peer_succeeded(
+        &mut self,
+        direction: PeerDirection,
+        address: String,
+        remote_height: u64,
+        remote_tip: [u8; 32],
+        now: u64,
+    ) {
+        let Some(record) = self.peer_observation_mut(direction, address, now) else {
+            return;
+        };
+        record.last_seen = now;
+        record.last_success = Some(now);
+        record.last_attempt_succeeded = true;
+        record.successful_sessions = record.successful_sessions.saturating_add(1);
+        record.remote_height = Some(remote_height);
+        record.remote_tip = Some(remote_tip);
+    }
+
+    pub(crate) fn record_peer_ended(
+        &mut self,
+        direction: PeerDirection,
+        address: String,
+        failed: bool,
+        now: u64,
+    ) {
+        let Some(record) = self.peer_observation_mut(direction, address, now) else {
+            return;
+        };
+        record.last_seen = now;
+        record.active_connections = record.active_connections.saturating_sub(1);
+        if failed {
+            record.last_attempt_succeeded = false;
+            record.failed_sessions = record.failed_sessions.saturating_add(1);
+        }
+    }
+
+    fn peer_observation_mut(
+        &mut self,
+        direction: PeerDirection,
+        address: String,
+        now: u64,
+    ) -> Option<&mut PeerObservationRecord> {
+        let key = PeerObservationKey { direction, address };
+        if !self.peer_observations.contains_key(&key)
+            && self.peer_observations.len() >= MAX_OBSERVED_PEERS
+        {
+            let eviction = self
+                .peer_observations
+                .iter()
+                .filter(|(_, record)| record.active_connections == 0)
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.last_seen
+                        .cmp(&right.last_seen)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone());
+            let eviction = eviction?;
+            self.peer_observations.remove(&eviction);
+        }
+        Some(
+            self.peer_observations
+                .entry(key)
+                .or_insert(PeerObservationRecord {
+                    first_seen: now,
+                    last_seen: now,
+                    last_success: None,
+                    last_attempt_succeeded: false,
+                    successful_sessions: 0,
+                    failed_sessions: 0,
+                    active_connections: 0,
+                    remote_height: None,
+                    remote_tip: None,
+                }),
+        )
+    }
+
+    fn peer_observations(&self) -> Vec<PeerObservation> {
+        let mut peers: Vec<_> = self
+            .peer_observations
+            .iter()
+            .map(|(key, record)| PeerObservation {
+                address: key.address.clone(),
+                direction: key.direction,
+                state: if record.active_connections > 0 {
+                    PeerState::Connected
+                } else if record.last_attempt_succeeded {
+                    PeerState::Reachable
+                } else {
+                    PeerState::Failed
+                },
+                first_seen: record.first_seen,
+                last_seen: record.last_seen,
+                last_success: record.last_success,
+                successful_sessions: record.successful_sessions,
+                failed_sessions: record.failed_sessions,
+                active_connections: record.active_connections,
+                remote_height: record.remote_height,
+                remote_tip: record.remote_tip.map(hex::encode),
+            })
+            .collect();
+        peers.sort_by(|left, right| {
+            right
+                .active_connections
+                .cmp(&left.active_connections)
+                .then_with(|| right.last_seen.cmp(&left.last_seen))
+                .then_with(|| left.direction.cmp(&right.direction))
+                .then_with(|| left.address.cmp(&right.address))
+        });
+        peers
     }
 
     /// Returns the Devnet-0 wallet view for this data directory.
@@ -3529,6 +3709,33 @@ mod tests {
     }
 
     #[test]
+    fn peer_observations_are_bounded_ordered_and_runtime_only() {
+        let path = test_dir("peer-observations");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        for index in 0..(MAX_OBSERVED_PEERS + 2) {
+            let address = format!("127.0.0.1:{}", 20_000 + index);
+            let now = index as u64 + 1;
+            node.record_peer_started(PeerDirection::Outbound, address.clone(), now);
+            node.record_peer_ended(PeerDirection::Outbound, address, true, now);
+        }
+
+        let peers = node.status().unwrap().peers;
+        assert_eq!(peers.len(), MAX_OBSERVED_PEERS);
+        assert_eq!(peers[0].address, "127.0.0.1:20065");
+        assert_eq!(peers[0].state, PeerState::Failed);
+        assert_eq!(peers[0].failed_sessions, 1);
+        assert!(!peers.iter().any(|peer| peer.address == "127.0.0.1:20000"));
+        assert!(!peers.iter().any(|peer| peer.address == "127.0.0.1:20001"));
+        drop(node);
+
+        let reopened = Node::open(&path).unwrap();
+        assert!(reopened.status().unwrap().peers.is_empty());
+        drop(reopened);
+        clean_test_dir(&path);
+    }
+
+    #[test]
     fn peer_hello_binds_live_tip_and_canonical_u512_work() {
         let path = test_dir("peer-hello");
         clean_test_dir(&path);
@@ -5029,7 +5236,7 @@ mod tests {
             assert!(value["balances"][field].is_string());
         }
         let serialized = String::from_utf8(response.body).unwrap();
-        assert!(serialized.contains("DEVNET-0 TEST WALLET"));
+        assert!(serialized.contains("Devnet-0 test wallet"));
         let wallet_secret = hex::encode(fs::read(path.join(WALLET_KEY_FILE)).unwrap());
         assert!(!serialized.contains(&wallet_secret));
         assert!(!serialized.contains(&hex::encode([0x13; 32])));

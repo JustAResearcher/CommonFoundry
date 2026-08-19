@@ -315,7 +315,7 @@ export function SendDialog({
 
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              {wallet?.warning ?? "Devnet-0 test wallet unavailable. Never send real value."}
+              {wallet?.warning ?? "Devnet-0 test wallet unavailable."}
             </p>
 
             <div className="dialog-actions">
@@ -352,7 +352,7 @@ export function SendDialog({
             </div>
             {errors.form && <p className="form-error form-error-summary" role="alert">{errors.form}</p>}
             <p className="warning-inline" role="note">
-              Devnet-0 only · Unencrypted test wallet · Test funds have no value.
+              Devnet-0 test transaction · Verify the recipient and amount before sending.
             </p>
             <div className="dialog-actions">
               <button
