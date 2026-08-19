@@ -6,7 +6,7 @@ body:
     id: version
     attributes:
       label: Release
-      placeholder: v0.1.0-devnet.9
+      placeholder: v0.1.0-devnet.10
     validations:
       required: true
   - type: textarea

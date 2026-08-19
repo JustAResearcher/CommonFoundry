@@ -28,8 +28,10 @@ NVIDIA driver but do not need to install the CUDA toolkit.
 
 The desktop wallet drives one selected GPU. The separate `cmfd-miner` package
 automatically drives every supported GPU in a rig with one CUDA context and
-worker per device. See [Standalone CUDA miner](standalone-miner.md) for its
-Windows batch-file setup and multi-GPU behavior.
+worker per device. Its normal mode receives immutable mining templates from a
+node rather than synchronizing another chain database. See
+[Standalone CUDA miner](standalone-miner.md) for its Windows batch-file setup
+and multi-GPU behavior.
 
 ## Exact trust boundary
 

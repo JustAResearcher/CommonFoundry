@@ -8,8 +8,6 @@ rem ================================================================
 rem These defaults work with a wallet on this PC or the community bootstrap.
 set "LOCAL_PEER=127.0.0.1:18444"
 set "BOOTSTRAP_PEER=107.214.187.2:18444"
-set "P2P_BIND=127.0.0.1:19444"
-set "DATA_DIR=%LOCALAPPDATA%\Common Foundry Miner\devnet-0"
 set "GPU_INDEXES="
 rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="
@@ -21,11 +19,18 @@ rem   blank   = use every supported NVIDIA GPU
 rem   0       = use GPU 0 only
 rem   0,1,2,3 = use GPUs 0 through 3
 rem Run LIST-GPUS.bat to see the indexes on this rig.
-rem Leaving PAYOUT_ADDRESS blank creates/reuses this miner's local key.
+rem PAYOUT_ADDRESS is required because the connected node creates the block.
 rem ================================================================
 
 if not exist "%~dp0cmfd-miner.exe" (
   echo ERROR: cmfd-miner.exe is missing from this folder.
+  pause
+  exit /b 1
+)
+
+if not defined PAYOUT_ADDRESS (
+  echo ERROR: Set PAYOUT_ADDRESS to the 64-character receive address shown by your wallet.
+  echo Right-click START-MINER.bat, choose Edit, and fill in PAYOUT_ADDRESS near the top.
   pause
   exit /b 1
 )
@@ -40,9 +45,6 @@ if defined GPU_INDEXES (
   for %%G in (!GPU_LIST!) do set "DEVICE_ARGS=!DEVICE_ARGS! --device %%G"
 )
 
-set "PAYOUT_ARGS="
-if defined PAYOUT_ADDRESS set "PAYOUT_ARGS=--miner %PAYOUT_ADDRESS%"
-
 echo Starting Common Foundry miner...
 echo Local wallet peer: %LOCAL_PEER%
 echo Bootstrap fallback: %BOOTSTRAP_PEER%
@@ -54,11 +56,9 @@ if defined GPU_INDEXES (
 echo.
 
 "%~dp0cmfd-miner.exe" mine ^
-  --data-dir "%DATA_DIR%" ^
-  --p2p-bind %P2P_BIND% ^
   !PEER_ARGS! ^
   !DEVICE_ARGS! ^
-  !PAYOUT_ARGS! ^
+  --miner %PAYOUT_ADDRESS% ^
   --batch-size %BATCH_SIZE% ^
   --stats-seconds %STATS_SECONDS%
 

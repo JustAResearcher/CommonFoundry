@@ -11,14 +11,15 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use cmfd_consensus::{
-    Block, MAX_BLOCK_BYTES, MAX_TRANSACTION_BYTES, Transaction, WireError, decode_block,
-    decode_transaction, encode_block, encode_transaction,
+    Block, BlockChallenge, BlockProof, Coinbase, MAX_BLOCK_BYTES, MAX_BLOCK_TRANSACTIONS,
+    MAX_COINBASE_OUTPUTS, MAX_TRANSACTION_BYTES, OutputLock, Transaction, TxOutput, WireError,
+    decode_block, decode_transaction, encode_block, encode_transaction, merkle_root,
 };
 use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use thiserror::Error;
 
 pub const PEER_MAGIC: [u8; 4] = *b"CMFP";
-pub const PEER_PROTOCOL_VERSION: u16 = 2;
+pub const PEER_PROTOCOL_VERSION: u16 = 3;
 pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
@@ -44,6 +45,10 @@ pub const GET_TRANSACTION_KIND: u8 = 8;
 pub const TRANSACTION_KIND: u8 = 9;
 pub const SUBMIT_BLOCK_KIND: u8 = 10;
 pub const BLOCK_SUBMISSION_RESULT_KIND: u8 = 11;
+pub const GET_MINING_TEMPLATE_KIND: u8 = 12;
+pub const MINING_TEMPLATE_KIND: u8 = 13;
+
+const BLOCK_CHALLENGE_BYTES: usize = 32 + 32 + 32 + 8 + 8 + 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChainWork(pub [u8; 64]);
@@ -90,6 +95,28 @@ pub struct BlockSubmissionResult {
     pub peer_tip: [u8; 32],
 }
 
+/// A complete node-selected block template without a proof. A thin miner only
+/// evaluates the immutable challenge, inserts its proof, and returns the
+/// resulting canonical block to the node for normal consensus validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiningTemplate {
+    pub challenge: BlockChallenge,
+    pub coinbase: Coinbase,
+    pub transactions: Vec<Transaction>,
+}
+
+impl MiningTemplate {
+    pub fn into_block(self, proof: BlockProof) -> Block {
+        Block {
+            version: cmfd_consensus::BLOCK_VERSION,
+            challenge: self.challenge,
+            proof,
+            coinbase: self.coinbase,
+            transactions: self.transactions,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
     Hello(PeerHello),
@@ -118,6 +145,10 @@ pub enum PeerMessage {
     },
     /// A decoded canonical candidate. Receiving it never mutates the mempool.
     Transaction(Transaction),
+    GetMiningTemplate {
+        payout: [u8; 32],
+    },
+    MiningTemplate(MiningTemplate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,6 +313,10 @@ pub enum PeerError {
     NonCanonicalBlock,
     #[error("transaction frame is not canonical")]
     NonCanonicalTransaction,
+    #[error("mining template is invalid: {0}")]
+    InvalidMiningTemplate(&'static str),
+    #[error("unknown mining-template output-lock tag {0}")]
+    InvalidMiningOutputLockTag(u8),
     #[error(transparent)]
     ConsensusWire(#[from] WireError),
 }
@@ -459,6 +494,12 @@ fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
             }
             Ok((TRANSACTION_KIND, payload))
         }
+        PeerMessage::GetMiningTemplate { payout } => {
+            Ok((GET_MINING_TEMPLATE_KIND, payout.to_vec()))
+        }
+        PeerMessage::MiningTemplate(template) => {
+            Ok((MINING_TEMPLATE_KIND, encode_mining_template(template)?))
+        }
     }
 }
 
@@ -597,8 +638,199 @@ fn decode_message(
             }
             Ok(PeerMessage::Transaction(transaction))
         }
+        GET_MINING_TEMPLATE_KIND => {
+            let mut reader = PayloadReader::new(payload);
+            let payout = reader.array()?;
+            reader.finish()?;
+            Ok(PeerMessage::GetMiningTemplate { payout })
+        }
+        MINING_TEMPLATE_KIND => Ok(PeerMessage::MiningTemplate(decode_mining_template(
+            payload,
+            expected_network_id,
+        )?)),
         other => Err(PeerError::UnknownKind(other)),
     }
+}
+
+fn encode_mining_template(template: &MiningTemplate) -> Result<Vec<u8>, PeerError> {
+    validate_mining_template(template, template.challenge.network_id)?;
+    let mut payload = Vec::with_capacity(BLOCK_CHALLENGE_BYTES + 128);
+    encode_block_challenge(&template.challenge, &mut payload);
+    payload.extend_from_slice(&template.coinbase.height.to_le_bytes());
+    payload.push(template.coinbase.outputs.len() as u8);
+    for output in &template.coinbase.outputs {
+        encode_template_output(output, &mut payload);
+    }
+    payload.extend_from_slice(&(template.transactions.len() as u16).to_le_bytes());
+    for transaction in &template.transactions {
+        let encoded = encode_transaction(transaction)?;
+        let length = u32::try_from(encoded.len()).map_err(|_| PeerError::PayloadTooLarge {
+            actual: encoded.len(),
+            max: MAX_TRANSACTION_BYTES,
+        })?;
+        payload.extend_from_slice(&length.to_le_bytes());
+        payload.extend_from_slice(&encoded);
+    }
+    Ok(payload)
+}
+
+fn decode_mining_template(
+    payload: &[u8],
+    expected_network_id: [u8; 32],
+) -> Result<MiningTemplate, PeerError> {
+    let mut reader = PayloadReader::new(payload);
+    let challenge = decode_block_challenge(&mut reader, expected_network_id)?;
+    let coinbase_height = reader.u64()?;
+    let output_count = reader.u8()? as usize;
+    if output_count > MAX_COINBASE_OUTPUTS {
+        return Err(PeerError::CountLimit {
+            field: "mining template coinbase outputs",
+            actual: output_count,
+            max: MAX_COINBASE_OUTPUTS,
+        });
+    }
+    let mut outputs = Vec::with_capacity(output_count);
+    for _ in 0..output_count {
+        outputs.push(decode_template_output(&mut reader)?);
+    }
+    let transaction_count = reader.u16()? as usize;
+    if transaction_count > MAX_BLOCK_TRANSACTIONS {
+        return Err(PeerError::CountLimit {
+            field: "mining template transactions",
+            actual: transaction_count,
+            max: MAX_BLOCK_TRANSACTIONS,
+        });
+    }
+    let mut transactions = Vec::with_capacity(transaction_count);
+    for _ in 0..transaction_count {
+        let length = reader.u32()? as usize;
+        if length > MAX_TRANSACTION_BYTES {
+            return Err(PeerError::PayloadTooLarge {
+                actual: length,
+                max: MAX_TRANSACTION_BYTES,
+            });
+        }
+        let encoded = reader.take(length)?;
+        let transaction = decode_transaction(encoded, expected_network_id)?;
+        if encode_transaction(&transaction)? != encoded {
+            return Err(PeerError::NonCanonicalTransaction);
+        }
+        transactions.push(transaction);
+    }
+    reader.finish()?;
+    let template = MiningTemplate {
+        challenge,
+        coinbase: Coinbase {
+            height: coinbase_height,
+            outputs,
+        },
+        transactions,
+    };
+    validate_mining_template(&template, expected_network_id)?;
+    Ok(template)
+}
+
+fn validate_mining_template(
+    template: &MiningTemplate,
+    expected_network_id: [u8; 32],
+) -> Result<(), PeerError> {
+    if template.challenge.network_id != expected_network_id {
+        return Err(PeerError::WrongNetwork);
+    }
+    if template.coinbase.height != template.challenge.height {
+        return Err(PeerError::InvalidMiningTemplate(
+            "coinbase height does not match challenge height",
+        ));
+    }
+    if template.coinbase.outputs.len() > MAX_COINBASE_OUTPUTS {
+        return Err(PeerError::CountLimit {
+            field: "mining template coinbase outputs",
+            actual: template.coinbase.outputs.len(),
+            max: MAX_COINBASE_OUTPUTS,
+        });
+    }
+    if template.transactions.len() > MAX_BLOCK_TRANSACTIONS {
+        return Err(PeerError::CountLimit {
+            field: "mining template transactions",
+            actual: template.transactions.len(),
+            max: MAX_BLOCK_TRANSACTIONS,
+        });
+    }
+    if template
+        .transactions
+        .iter()
+        .any(|transaction| transaction.network_id != expected_network_id)
+    {
+        return Err(PeerError::WrongNetwork);
+    }
+    let mut commitments = Vec::with_capacity(template.transactions.len().saturating_add(1));
+    commitments.push(template.coinbase.commitment(expected_network_id));
+    commitments.extend(template.transactions.iter().map(Transaction::txid));
+    if merkle_root(&commitments) != template.challenge.transaction_root {
+        return Err(PeerError::InvalidMiningTemplate(
+            "transaction root does not match template contents",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_block_challenge(challenge: &BlockChallenge, payload: &mut Vec<u8>) {
+    payload.extend_from_slice(&challenge.network_id);
+    payload.extend_from_slice(&challenge.previous_block);
+    payload.extend_from_slice(&challenge.transaction_root);
+    payload.extend_from_slice(&challenge.height.to_le_bytes());
+    payload.extend_from_slice(&challenge.timestamp.to_le_bytes());
+    payload.extend_from_slice(&challenge.target);
+}
+
+fn decode_block_challenge(
+    reader: &mut PayloadReader<'_>,
+    expected_network_id: [u8; 32],
+) -> Result<BlockChallenge, PeerError> {
+    let challenge = BlockChallenge {
+        network_id: reader.array()?,
+        previous_block: reader.array()?,
+        transaction_root: reader.array()?,
+        height: reader.u64()?,
+        timestamp: reader.u64()?,
+        target: reader.array()?,
+    };
+    if challenge.network_id != expected_network_id {
+        return Err(PeerError::WrongNetwork);
+    }
+    Ok(challenge)
+}
+
+fn encode_template_output(output: &TxOutput, payload: &mut Vec<u8>) {
+    payload.extend_from_slice(&output.value.to_le_bytes());
+    match output.lock {
+        OutputLock::Key(key) => {
+            payload.push(0);
+            payload.extend_from_slice(&key);
+        }
+        OutputLock::InferenceChannel { channel_id } => {
+            payload.push(1);
+            payload.extend_from_slice(&channel_id);
+        }
+    }
+    payload.extend_from_slice(&output.spendable_height.to_le_bytes());
+}
+
+fn decode_template_output(reader: &mut PayloadReader<'_>) -> Result<TxOutput, PeerError> {
+    let value = reader.u64()?;
+    let lock = match reader.u8()? {
+        0 => OutputLock::Key(reader.array()?),
+        1 => OutputLock::InferenceChannel {
+            channel_id: reader.array()?,
+        },
+        tag => return Err(PeerError::InvalidMiningOutputLockTag(tag)),
+    };
+    let spendable_height = reader.u64()?;
+    Ok(TxOutput {
+        value,
+        lock,
+        spendable_height,
+    })
 }
 
 fn validate_hello(hello: &PeerHello) -> Result<(), PeerError> {
@@ -663,6 +895,12 @@ impl<'a> PayloadReader<'a> {
     fn u16(&mut self) -> Result<u16, PeerError> {
         Ok(u16::from_le_bytes(
             self.take(2)?.try_into().expect("fixed payload field"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, PeerError> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().expect("fixed payload field"),
         ))
     }
 
@@ -1084,6 +1322,8 @@ fn validate_frame_header(header: &[u8]) -> Result<(), PeerError> {
             | TRANSACTION_KIND
             | SUBMIT_BLOCK_KIND
             | BLOCK_SUBMISSION_RESULT_KIND
+            | GET_MINING_TEMPLATE_KIND
+            | MINING_TEMPLATE_KIND
     ) {
         return Err(PeerError::UnknownKind(header[6]));
     }
@@ -1191,6 +1431,11 @@ mod tests {
     fn all_messages() -> Vec<PeerMessage> {
         let block = sample_block();
         let block_id = block.block_id();
+        let template = MiningTemplate {
+            challenge: block.challenge,
+            coinbase: block.coinbase.clone(),
+            transactions: block.transactions.clone(),
+        };
         vec![
             PeerMessage::Hello(hello(1, 7, 9)),
             PeerMessage::GetHeaders {
@@ -1215,6 +1460,10 @@ mod tests {
             },
             PeerMessage::GetTransaction { txid: [9; 32] },
             PeerMessage::Transaction(sample_transaction(NETWORK_ID)),
+            PeerMessage::GetMiningTemplate {
+                payout: crate::default_miner_destination(),
+            },
+            PeerMessage::MiningTemplate(template),
         ]
     }
 
@@ -1317,6 +1566,65 @@ mod tests {
                 NETWORK_ID
             ),
             Err(PeerError::InvalidBlockSubmissionStatus(0xff))
+        ));
+    }
+
+    #[test]
+    fn mining_templates_reject_wrong_network_shape_and_lock_tags() {
+        let block = sample_block();
+        let template = MiningTemplate {
+            challenge: block.challenge,
+            coinbase: block.coinbase,
+            transactions: block.transactions,
+        };
+
+        let mut wrong_network = encode_peer_frame(&PeerFrame {
+            sequence: 0,
+            message: PeerMessage::MiningTemplate(template.clone()),
+        })
+        .unwrap();
+        wrong_network[PEER_FRAME_HEADER_BYTES] ^= 1;
+        assert!(matches!(
+            decode_peer_frame(&wrong_network, NETWORK_ID),
+            Err(PeerError::WrongNetwork)
+        ));
+
+        let mut wrong_height = template.clone();
+        wrong_height.coinbase.height = wrong_height.coinbase.height.saturating_add(1);
+        assert!(matches!(
+            encode_peer_frame(&PeerFrame {
+                sequence: 0,
+                message: PeerMessage::MiningTemplate(wrong_height),
+            }),
+            Err(PeerError::InvalidMiningTemplate(
+                "coinbase height does not match challenge height"
+            ))
+        ));
+
+        let mut too_many_outputs = template.clone();
+        too_many_outputs.coinbase.outputs =
+            vec![template.coinbase.outputs[0].clone(); MAX_COINBASE_OUTPUTS + 1];
+        assert!(matches!(
+            encode_peer_frame(&PeerFrame {
+                sequence: 0,
+                message: PeerMessage::MiningTemplate(too_many_outputs),
+            }),
+            Err(PeerError::CountLimit {
+                field: "mining template coinbase outputs",
+                ..
+            })
+        ));
+
+        let mut encoded = encode_peer_frame(&PeerFrame {
+            sequence: 0,
+            message: PeerMessage::MiningTemplate(template),
+        })
+        .unwrap();
+        let first_lock_tag = PEER_FRAME_HEADER_BYTES + BLOCK_CHALLENGE_BYTES + 8 + 1 + 8;
+        encoded[first_lock_tag] = 0xff;
+        assert!(matches!(
+            decode_peer_frame(&encoded, NETWORK_ID),
+            Err(PeerError::InvalidMiningOutputLockTag(0xff))
         ));
     }
 

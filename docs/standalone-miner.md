@@ -1,8 +1,11 @@
 # Common Foundry standalone CUDA miner
 
 `cmfd-miner` is a separate command-line miner for dedicated NVIDIA mining
-rigs. It embeds a Devnet node, maintains its own data directory, and runs one
-independent CUDA worker on every selected GPU.
+rigs. Normal `mine` mode is a thin client: it asks a configured Devnet node for
+a complete mining template, searches the immutable proof-of-work challenge,
+and returns the finished block to that node. It does not download the chain or
+maintain a second node database. One independent CUDA worker runs on every
+selected GPU.
 
 ## Supported GPUs
 
@@ -57,9 +60,9 @@ The Windows ZIP includes:
 Run `LIST-GPUS.bat`, then launch `START-MINER.bat`. Its defaults try a GUI
 wallet on the same computer first and the community bootstrap second, so the
 peer settings normally need no editing. Leave `GPU_INDEXES` blank to use every
-supported card automatically. Miner chain data is stored under the current
-user's application-data directory, so installing or extracting a later miner
-release does not start over from height zero.
+supported card automatically. Copy the 64-character address from the wallet's
+**Receive** page into `PAYOUT_ADDRESS` before starting. The connected node owns
+the chain and creates each payout-bound template.
 
 ## Direct commands
 
@@ -72,39 +75,38 @@ cmfd-miner devices
 Mine with every supported GPU and the community bootstrap:
 
 ```text
-cmfd-miner mine --peer 127.0.0.1:18444 --peer 107.214.187.2:18444 --allow-public-peers
+cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --peer 107.214.187.2:18444 --allow-public-peers
 ```
 
 Select GPUs 0, 1, and 3:
 
 ```text
-cmfd-miner mine --device 0 --device 1 --device 3
+cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --device 0 --device 1 --device 3
 ```
 
 Change the live-statistics interval from its five-second default:
 
 ```text
-cmfd-miner mine --stats-seconds 10
+cmfd-miner mine --miner <64-character-wallet-receive-address> --peer 127.0.0.1:18444 --stats-seconds 10
 ```
 
-The standalone miner currently performs continuous solo mining. Its embedded
-node owns the selected data directory, so do not open the GUI wallet against
-that same directory while the miner is running. The existing wallet remains
-the Pool-mode client for this Devnet iteration.
+The standalone miner currently performs continuous solo mining. The node
+selects the parent, transactions, timestamp, target, and coinbase outputs. The
+miner changes only the proof nonce, fully verifies a CUDA candidate in Rust,
+and submits the complete canonical block. It prints `BLOCK ACCEPTED` only after
+at least one configured node answers `Accepted` or `AlreadyKnown`.
 
-The miner synchronizes in both directions over each configured peer session. It
-downloads and validates the selected node's active chain before starting any
-GPU work, immediately submits every locally accepted block to the configured
-node, and retries missing locally active blocks on the regular peer poll. The
-first start can therefore show `Syncing from ...` while it catches up; that is
-normal, and `Mining height ...` appears only after synchronization completes.
-A temporary disconnect shows `node sync pending` rather than a false remote
-acceptance; relay catches up automatically after reconnection.
-The packaged launchers configure two peers. `node sync 1/2` means one of them is
-reachable and block relay is working; `node sync pending 0/2` means neither is
-currently reachable.
+The miner checks its source node every two seconds. A changed parent cancels
+the current GPU job and fetches fresh work. A temporary disconnect pauses GPU
+work and retries the preferred node followed by the configured failover nodes.
+If all nodes disconnect after a block is found, the miner retains and retries
+that exact block until a node accepts or rejects it.
 
 `--miner` (or `PAYOUT_ADDRESS` in the packaged launch file) selects the coinbase
 payout destination. It does not identify or locate a node. `--peer` selects the
 node that receives blocks. One outbound miner-to-node peer configuration is
 enough; the wallet/node does not also need to list the miner as a peer.
+
+For diagnostics, `cmfd-miner full-node` preserves the former embedded-node
+mode with its own data directory and P2P listener. Normal rig operation should
+use `cmfd-miner mine` or the packaged launcher.

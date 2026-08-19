@@ -1,16 +1,15 @@
 COMMON FOUNDRY STANDALONE CUDA MINER
 
-1. Run: chmod +x start-miner.sh && ./start-miner.sh
-2. The defaults automatically find a wallet on this computer, or use the
-   community bootstrap when the wallet is elsewhere.
-3. No peer setting needs to be changed. Leave GPU_INDEXES empty to use every
-   supported NVIDIA GPU.
-4. Edit start-miner.sh only to change GPUs or the payout address.
+1. Open your wallet's Receive page and copy its 64-character address.
+2. Edit start-miner.sh and paste that address into PAYOUT_ADDRESS.
+3. Run: chmod +x start-miner.sh && ./start-miner.sh
+4. Leave GPU_INDEXES empty to use every supported NVIDIA GPU.
 5. Leave the terminal open. Press Ctrl+C to stop cleanly.
 
-The miner downloads the node's current chain before starting GPU work. Seeing
-"Syncing from ..." on the first start is normal. Chain data stays under
-XDG_DATA_HOME (or ~/.local/share) across miner upgrades.
+The miner requests current work directly from the first reachable node. It does
+not download or maintain another copy of the blockchain. The connected wallet
+or node performs synchronization, builds templates, validates blocks, and
+records accepted rewards for PAYOUT_ADDRESS.
 
 To select specific cards, use a comma-separated list:
   GPU_INDEXES="0,1,2,3"
@@ -33,5 +32,8 @@ show N/A and do not interrupt mining. Edit STATS_SECONDS in start-miner.sh to
 change the reporting interval.
 
 The miner first tries the local wallet at 127.0.0.1:18444, then the community
-bootstrap. A status such as "node sync 1/2" means one peer is connected and is
-working normally. Temporary relay failures retry automatically.
+bootstrap. It pauses GPU work when neither node is reachable, rebuilds work when
+the node tip changes, and reports a block only after a node acknowledges it.
+
+Advanced operators who intentionally want a second full node can run
+"cmfd-miner full-node --help". Normal mining should use start-miner.sh.

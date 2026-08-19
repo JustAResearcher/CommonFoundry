@@ -125,6 +125,14 @@ precision. The Network page shows recent inbound and outbound peer sessions,
 their reported heights and tips, reachability, and success/failure counts. Peer
 observations are bounded runtime telemetry and reset when the node restarts.
 
+The standalone multi-GPU miner connects directly to this node's P2P address.
+Normal `cmfd-miner mine` mode does not run or synchronize another node: it asks
+the wallet/node for a complete template tied to the miner's receive address,
+searches that immutable challenge, and submits the completed block for ordinary
+validation. The node remains responsible for chain sync, mempool selection,
+durable storage, and fork choice. See
+[Standalone CUDA miner](standalone-miner.md) for launcher and failover details.
+
 The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the
 exact form `cmfd+tls://PRIVATE_IP:PORT?pin=64_HEX` and a worker name matching
 `[A-Za-z0-9._-]{1,32}`. The endpoint must be a numeric loopback, RFC1918 IPv4,

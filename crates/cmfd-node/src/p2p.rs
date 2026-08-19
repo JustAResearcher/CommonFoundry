@@ -20,7 +20,7 @@ use crate::peer::{
     BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
     PeerHello, PeerLimits, PeerMessage, PeerSession, StaticPeerConfig,
 };
-use crate::{Node, NodeError, PeerDirection, unix_time_seconds};
+use crate::{Node, NodeError, PeerDirection, devnet_params, unix_time_seconds};
 
 /// One request is deliberately small enough that sixteen maximum-size blocks,
 /// sixty-four maximum-size transactions, their outer peer frames, and
@@ -74,6 +74,10 @@ pub enum P2pError {
     UnknownRequestedBlock([u8; 32]),
     #[error("peer requested an unknown mempool transaction {0:?}")]
     UnknownRequestedTransaction([u8; 32]),
+    #[error("peer returned a mining template that does not extend its advertised tip")]
+    UnexpectedMiningTemplate,
+    #[error("peer returned a mining template with the wrong miner payout destination")]
+    UnexpectedMiningPayout,
     #[error("peer polling interval must be nonzero")]
     ZeroPollInterval,
     #[error("peer service thread panicked")]
@@ -106,6 +110,12 @@ pub struct RelayReport {
     pub peer_tip: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiningTemplateResponse {
+    pub remote_hello: PeerHello,
+    pub template: crate::peer::MiningTemplate,
+}
+
 impl SyncReport {
     pub fn up_to_date(&self) -> bool {
         self.inventory_items == 0
@@ -114,6 +124,78 @@ impl SyncReport {
                 .saturating_sub(self.already_known_transactions)
                 <= self.requested_transactions
     }
+}
+
+/// Fetches one complete immutable mining template without downloading or
+/// maintaining the remote node's chain. The node chooses all block contents;
+/// the caller only searches the returned challenge.
+pub fn request_mining_template_once_with_policy(
+    address: SocketAddr,
+    payout: [u8; 32],
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<MiningTemplateResponse, P2pError> {
+    let hello = thin_miner_hello()?;
+    let session = PeerSession::new(hello, limits)?;
+    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    connection.send_hello()?;
+    let remote_hello = expect_hello(connection.receive()?)?;
+    connection.send(PeerMessage::GetMiningTemplate { payout })?;
+    let template = expect_mining_template(connection.receive()?)?;
+    if template.challenge.previous_block != remote_hello.tip
+        || template.challenge.height != remote_hello.height.saturating_add(1)
+    {
+        return Err(P2pError::UnexpectedMiningTemplate);
+    }
+    if !matches!(
+        template.coinbase.outputs.first(),
+        Some(cmfd_consensus::TxOutput {
+            lock: cmfd_consensus::OutputLock::Key(destination),
+            ..
+        }) if *destination == payout
+    ) {
+        return Err(P2pError::UnexpectedMiningPayout);
+    }
+    Ok(MiningTemplateResponse {
+        remote_hello,
+        template,
+    })
+}
+
+/// Submits a complete node-selected template with its mined proof. Consensus
+/// validation and durable acceptance remain exclusively on the receiving node.
+pub fn submit_mined_block_once_with_policy(
+    address: SocketAddr,
+    block: Block,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<BlockSubmissionResult, P2pError> {
+    let submitted = block.block_id();
+    let session = PeerSession::new(thin_miner_hello()?, limits)?;
+    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    connection.send_hello()?;
+    expect_hello(connection.receive()?)?;
+    connection.send(PeerMessage::SubmitBlock(block))?;
+    let result = expect_block_submission_result(connection.receive()?)?;
+    if result.block_id != submitted {
+        return Err(P2pError::WrongBlockSubmission {
+            submitted,
+            actual: result.block_id,
+        });
+    }
+    Ok(result)
+}
+
+fn thin_miner_hello() -> Result<PeerHello, P2pError> {
+    let params = devnet_params()?;
+    Ok(PeerHello {
+        network_id: params.network_id,
+        consensus_fingerprint: params.fingerprint().map_err(NodeError::from)?,
+        node_nonce: crate::peer::process_node_nonce(),
+        tip: params.genesis_hash,
+        height: 0,
+        cumulative_work: crate::peer::ChainWork::ZERO,
+    })
 }
 
 /// Performs one bounded pull from a configured peer.
@@ -600,6 +682,17 @@ fn perform_respond_to_peer_inner_with_policy(
                 }
                 connection.send(PeerMessage::Transaction(transaction))?;
             }
+            PeerMessage::GetMiningTemplate { payout } => {
+                let template = {
+                    let node = lock_node(&shared)?;
+                    node.build_template(payout, unix_time_seconds()?)?
+                };
+                connection.send(PeerMessage::MiningTemplate(crate::peer::MiningTemplate {
+                    challenge: template.challenge,
+                    coinbase: template.coinbase,
+                    transactions: template.transactions,
+                }))?;
+            }
             PeerMessage::SubmitBlock(block) => {
                 let block_id = block.block_id();
                 let accepted_at = unix_time_seconds()?;
@@ -626,7 +719,7 @@ fn perform_respond_to_peer_inner_with_policy(
             }
             other => {
                 return Err(P2pError::UnexpectedMessage {
-                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, or SubmitBlock",
+                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, GetMiningTemplate, or SubmitBlock",
                     actual: message_name(&other),
                 });
             }
@@ -1061,6 +1154,16 @@ fn expect_block_submission_result(message: PeerMessage) -> Result<BlockSubmissio
     }
 }
 
+fn expect_mining_template(message: PeerMessage) -> Result<crate::peer::MiningTemplate, P2pError> {
+    match message {
+        PeerMessage::MiningTemplate(template) => Ok(template),
+        other => Err(P2pError::UnexpectedMessage {
+            expected: "MiningTemplate",
+            actual: message_name(&other),
+        }),
+    }
+}
+
 fn message_name(message: &PeerMessage) -> &'static str {
     match message {
         PeerMessage::Hello(_) => "Hello",
@@ -1074,6 +1177,8 @@ fn message_name(message: &PeerMessage) -> &'static str {
         PeerMessage::TransactionInventory { .. } => "TransactionInventory",
         PeerMessage::GetTransaction { .. } => "GetTransaction",
         PeerMessage::Transaction(_) => "Transaction",
+        PeerMessage::GetMiningTemplate { .. } => "GetMiningTemplate",
+        PeerMessage::MiningTemplate(_) => "MiningTemplate",
     }
 }
 
@@ -1091,7 +1196,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use cmfd_consensus::{
-        InputWitness, OutPoint, OutputLock, TRANSACTION_VERSION, TxInput, TxOutput,
+        ConsensusPowVerifier, InputWitness, OutPoint, OutputLock, TRANSACTION_VERSION, TxInput,
+        TxOutput, v2_test_reference,
     };
     use k256::schnorr::SigningKey;
 
@@ -1789,6 +1895,95 @@ mod tests {
         drop(target);
         clean_test_dir(&source_path);
         clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn thin_miner_fetches_a_template_and_submits_without_a_local_chain() {
+        let node_path = test_dir("thin-mining-node");
+        let node = open_shared(&node_path);
+        let payout = insecure_dev_destination(0x7a);
+        let (listener, address) = start_listener(Arc::clone(&node), TARGET_NONCE);
+
+        let response = request_mining_template_once_with_policy(
+            address,
+            payout,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap();
+        assert_eq!(response.remote_hello.height, 0);
+        assert_eq!(response.template.challenge.height, 1);
+        assert_eq!(
+            response.template.challenge.previous_block,
+            response.remote_hello.tip
+        );
+        assert!(response.template.coinbase.outputs.iter().any(
+            |output| matches!(output.lock, OutputLock::Key(destination) if destination == payout)
+        ));
+
+        let verifier = ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap());
+        let proof = verifier
+            .mine(&response.template.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let block = response.template.into_block(proof);
+        let block_id = block.block_id();
+        let result = submit_mined_block_once_with_policy(
+            address,
+            block,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, BlockSubmissionStatus::Accepted);
+        assert_eq!(result.block_id, block_id);
+        assert_eq!(result.peer_height, 1);
+        assert_eq!(node.lock().unwrap().peer_hello().tip, block_id);
+
+        listener.stop().unwrap();
+        drop(node);
+        clean_test_dir(&node_path);
+    }
+
+    #[test]
+    fn thin_miner_stale_template_cannot_advance_the_active_tip() {
+        let node_path = test_dir("thin-mining-stale-template");
+        let node = open_shared(&node_path);
+        let payout = insecure_dev_destination(0x7b);
+        let (listener, address) = start_listener(Arc::clone(&node), TARGET_NONCE);
+
+        let stale = request_mining_template_once_with_policy(
+            address,
+            payout,
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap()
+        .template;
+        mine(&node, 1, unix_time_seconds().unwrap());
+        let current = node.lock().unwrap().peer_hello();
+
+        let verifier = ConsensusPowVerifier::v2_reference(v2_test_reference().unwrap());
+        let proof = verifier
+            .mine(&stale.challenge, 0, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let result = submit_mined_block_once_with_policy(
+            address,
+            stale.into_block(proof),
+            test_limits(),
+            PeerAddressPolicy::PrivateOnly,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, BlockSubmissionStatus::Accepted);
+        assert_ne!(result.block_id, result.peer_tip);
+        assert_eq!(result.peer_height, current.height);
+        assert_eq!(result.peer_tip, current.tip);
+        assert_eq!(node.lock().unwrap().peer_hello(), current);
+
+        listener.stop().unwrap();
+        drop(node);
+        clean_test_dir(&node_path);
     }
 
     #[test]

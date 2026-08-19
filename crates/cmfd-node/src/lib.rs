@@ -326,6 +326,15 @@ pub struct MiningJob {
     verifier: ConsensusPowVerifier,
 }
 
+/// Proof-of-work state that is independent of a local chain database. Thin
+/// miners construct this from a node-provided challenge and return only the
+/// resulting proof inside that node's complete template.
+#[derive(Debug, Clone)]
+pub struct MiningWork {
+    challenge: BlockChallenge,
+    verifier: ConsensusPowVerifier,
+}
+
 /// Exact progress from one bounded immutable mining-job search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MiningSearchResult {
@@ -379,6 +388,13 @@ impl MiningJob {
     /// The immutable consensus challenge represented by this job.
     pub fn challenge(&self) -> &BlockChallenge {
         &self.template.challenge
+    }
+
+    pub fn work(&self) -> MiningWork {
+        MiningWork {
+            challenge: self.template.challenge,
+            verifier: self.verifier.clone(),
+        }
     }
 
     pub fn accelerator_model(&self) -> Result<ForgeMatrixV2AcceleratorModel, NodeError> {
@@ -632,6 +648,108 @@ impl MiningJob {
             work_digest,
             meets_share_target: work_digest <= share_target,
             meets_chain_target: work_digest <= self.template.challenge.target,
+        })
+    }
+}
+
+impl MiningWork {
+    pub fn from_devnet_challenge(challenge: BlockChallenge) -> Result<Self, NodeError> {
+        let params = devnet_params()?;
+        if challenge.network_id != params.network_id || challenge.target > params.pow_limit {
+            return Err(NodeError::InvalidRpcRequest(
+                "mining challenge does not belong to this Devnet".to_owned(),
+            ));
+        }
+        let reference = v2_test_reference().map_err(PowError::from)?;
+        Ok(Self {
+            challenge,
+            verifier: ConsensusPowVerifier::v2_reference(reference),
+        })
+    }
+
+    pub fn challenge(&self) -> &BlockChallenge {
+        &self.challenge
+    }
+
+    pub fn accelerator_model(&self) -> Result<ForgeMatrixV2AcceleratorModel, NodeError> {
+        Ok(self.verifier.v2_accelerator_model()?)
+    }
+
+    pub fn prepare_accelerator_batch(
+        &self,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV2AcceleratorBatch, NodeError> {
+        Ok(self
+            .verifier
+            .prepare_v2_accelerator_batch(&self.challenge, start_nonce, count)?)
+    }
+
+    pub fn verify_accelerator_output(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        index: usize,
+        output: &[u8],
+    ) -> Result<[u8; 32], NodeError> {
+        self.verifier
+            .validate_v2_accelerator_batch(&self.challenge, batch)?;
+        let work_digest = batch
+            .candidate_work_digest(index, output)
+            .map_err(PowError::from)?;
+        self.verifier.verify_v2_accelerator_candidate(
+            &self.challenge,
+            batch,
+            index,
+            work_digest,
+        )?;
+        Ok(work_digest)
+    }
+
+    pub fn complete_accelerator_batch(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        outputs: &[u8],
+    ) -> Result<MiningShareSearchResult, NodeError> {
+        self.verifier
+            .validate_v2_accelerator_batch(&self.challenge, batch)?;
+        let expected_len = batch
+            .count()
+            .checked_mul(batch.activation_len() as u32)
+            .map(|length| length as usize)
+            .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+        if outputs.len() != expected_len {
+            return Err(NodeError::Pow(PowError::V2(
+                ForgeMatrixV2Error::AcceleratorOutputShape,
+            )));
+        }
+
+        for (index, output) in outputs.chunks_exact(batch.activation_len()).enumerate() {
+            let work_digest = batch
+                .candidate_work_digest(index, output)
+                .map_err(PowError::from)?;
+            if work_digest <= self.challenge.target {
+                let proof = self.verifier.verify_v2_accelerator_candidate(
+                    &self.challenge,
+                    batch,
+                    index,
+                    work_digest,
+                )?;
+                let nonce = batch
+                    .nonce_at(index)
+                    .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+                return Ok(MiningShareSearchResult::Found {
+                    proof,
+                    work_digest,
+                    meets_chain_target: true,
+                    attempts_completed: index as u64 + 1,
+                    next_nonce: nonce.wrapping_add(1),
+                });
+            }
+        }
+
+        Ok(MiningShareSearchResult::Exhausted {
+            attempts_completed: batch.count().into(),
+            next_nonce: batch.start_nonce().wrapping_add(u64::from(batch.count())),
         })
     }
 }
