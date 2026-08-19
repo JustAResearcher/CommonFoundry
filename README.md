@@ -98,9 +98,9 @@ cargo run -p cmfd-node -- run --p2p-bind 127.0.0.1:18444
 The defaults are RPC `127.0.0.1:18443`, P2P `127.0.0.1:18444`, and data
 directory `commonfoundry-devnet0`. The loopback RPC exposes health/status,
 templates, a bounded volatile mempool, canonical transaction/block submission,
-and development mining. Static peers exchange canonical blocks in bounded
-batches, then pull unknown mempool transactions through the same admission
-rules; transaction propagation is pull-only rather than a push broadcast. Each
+and development mining. Static peers exchange canonical blocks bidirectionally
+in bounded batches, then pull unknown mempool transactions through the same
+admission rules; transaction propagation remains pull-only. Each
 block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
@@ -188,8 +188,8 @@ Publish only the certificate and its pin, never `pool-key.der`. The generator
 creates the key with mode `0600` on Unix; on Windows, restrict the key and pool
 data directories with operator-only ACLs. TLS authenticates the pinned server,
 not worker or payout claims, so the volatile counters are not identity-secure.
-The explicit `18454` P2P bind avoids the wallet's default `18444`; configure
-reciprocal static peers if the wallet must follow blocks found by the pool.
+The explicit `18454` P2P bind avoids the wallet's default `18444`; configure one
+static peer link between the wallet and pool node for bidirectional block sync.
 See [docs/devnet-0.md](docs/devnet-0.md) for the full pool boundary and
 [apps/wallet/src-tauri/README.md](apps/wallet/src-tauri/README.md) for desktop
 static-peer command-line options.

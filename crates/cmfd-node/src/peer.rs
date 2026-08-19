@@ -18,7 +18,7 @@ use k256::elliptic_curve::rand_core::{OsRng, RngCore};
 use thiserror::Error;
 
 pub const PEER_MAGIC: [u8; 4] = *b"CMFP";
-pub const PEER_PROTOCOL_VERSION: u16 = 1;
+pub const PEER_PROTOCOL_VERSION: u16 = 2;
 pub const PEER_FRAME_HEADER_BYTES: usize = 20;
 pub const MAX_PEER_PAYLOAD_BYTES: usize = MAX_BLOCK_BYTES;
 pub const MAX_HEADER_LOCATORS: usize = 32;
@@ -42,6 +42,8 @@ pub const GET_MEMPOOL_KIND: u8 = 6;
 pub const TRANSACTION_INVENTORY_KIND: u8 = 7;
 pub const GET_TRANSACTION_KIND: u8 = 8;
 pub const TRANSACTION_KIND: u8 = 9;
+pub const SUBMIT_BLOCK_KIND: u8 = 10;
+pub const BLOCK_SUBMISSION_RESULT_KIND: u8 = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChainWork(pub [u8; 64]);
@@ -61,6 +63,33 @@ pub struct PeerHello {
     pub cumulative_work: ChainWork,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BlockSubmissionStatus {
+    Accepted = 0,
+    AlreadyKnown = 1,
+    Rejected = 2,
+}
+
+impl BlockSubmissionStatus {
+    fn from_byte(value: u8) -> Result<Self, PeerError> {
+        match value {
+            0 => Ok(Self::Accepted),
+            1 => Ok(Self::AlreadyKnown),
+            2 => Ok(Self::Rejected),
+            other => Err(PeerError::InvalidBlockSubmissionStatus(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockSubmissionResult {
+    pub block_id: [u8; 32],
+    pub status: BlockSubmissionStatus,
+    pub peer_height: u64,
+    pub peer_tip: [u8; 32],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerMessage {
     Hello(PeerHello),
@@ -76,6 +105,10 @@ pub enum PeerMessage {
     },
     /// A decoded canonical candidate. Receiving it never mutates chain state.
     Block(Block),
+    /// A canonical block offered for validation through the receiving node's
+    /// normal durable consensus path.
+    SubmitBlock(Block),
+    BlockSubmissionResult(BlockSubmissionResult),
     GetMempool,
     TransactionInventory {
         txids: Vec<[u8; 32]>,
@@ -187,6 +220,8 @@ pub enum PeerError {
     NonZeroFlags,
     #[error("unknown peer message kind {0}")]
     UnknownKind(u8),
+    #[error("invalid block-submission status {0}")]
+    InvalidBlockSubmissionStatus(u8),
     #[error("peer payload is {actual} bytes, exceeding the {max}-byte limit")]
     PayloadTooLarge { actual: usize, max: usize },
     #[error("peer frame contains {0} trailing bytes")]
@@ -394,6 +429,15 @@ fn encode_message(message: &PeerMessage) -> Result<(u8, Vec<u8>), PeerError> {
         }
         PeerMessage::GetBlock { block_id } => Ok((GET_BLOCK_KIND, block_id.to_vec())),
         PeerMessage::Block(block) => Ok((BLOCK_KIND, encode_block(block)?)),
+        PeerMessage::SubmitBlock(block) => Ok((SUBMIT_BLOCK_KIND, encode_block(block)?)),
+        PeerMessage::BlockSubmissionResult(result) => {
+            let mut payload = Vec::with_capacity(73);
+            payload.extend_from_slice(&result.block_id);
+            payload.push(result.status as u8);
+            payload.extend_from_slice(&result.peer_height.to_le_bytes());
+            payload.extend_from_slice(&result.peer_tip);
+            Ok((BLOCK_SUBMISSION_RESULT_KIND, payload))
+        }
         PeerMessage::GetMempool => Ok((GET_MEMPOOL_KIND, Vec::new())),
         PeerMessage::TransactionInventory { txids } => {
             validate_identifiers(txids, MAX_INVENTORY_ITEMS, "transaction inventory", false)?;
@@ -493,6 +537,24 @@ fn decode_message(
                 return Err(PeerError::NonCanonicalBlock);
             }
             Ok(PeerMessage::Block(block))
+        }
+        SUBMIT_BLOCK_KIND => {
+            let block = decode_block(payload, expected_network_id)?;
+            if encode_block(&block)? != payload {
+                return Err(PeerError::NonCanonicalBlock);
+            }
+            Ok(PeerMessage::SubmitBlock(block))
+        }
+        BLOCK_SUBMISSION_RESULT_KIND => {
+            let mut reader = PayloadReader::new(payload);
+            let result = BlockSubmissionResult {
+                block_id: reader.array()?,
+                status: BlockSubmissionStatus::from_byte(reader.u8()?)?,
+                peer_height: reader.u64()?,
+                peer_tip: reader.array()?,
+            };
+            reader.finish()?;
+            Ok(PeerMessage::BlockSubmissionResult(result))
         }
         GET_MEMPOOL_KIND => {
             PayloadReader::new(payload).finish()?;
@@ -602,6 +664,10 @@ impl<'a> PayloadReader<'a> {
         Ok(u16::from_le_bytes(
             self.take(2)?.try_into().expect("fixed payload field"),
         ))
+    }
+
+    fn u8(&mut self) -> Result<u8, PeerError> {
+        Ok(self.take(1)?[0])
     }
 
     fn u64(&mut self) -> Result<u64, PeerError> {
@@ -1016,6 +1082,8 @@ fn validate_frame_header(header: &[u8]) -> Result<(), PeerError> {
             | TRANSACTION_INVENTORY_KIND
             | GET_TRANSACTION_KIND
             | TRANSACTION_KIND
+            | SUBMIT_BLOCK_KIND
+            | BLOCK_SUBMISSION_RESULT_KIND
     ) {
         return Err(PeerError::UnknownKind(header[6]));
     }
@@ -1122,6 +1190,7 @@ mod tests {
 
     fn all_messages() -> Vec<PeerMessage> {
         let block = sample_block();
+        let block_id = block.block_id();
         vec![
             PeerMessage::Hello(hello(1, 7, 9)),
             PeerMessage::GetHeaders {
@@ -1132,7 +1201,14 @@ mod tests {
                 block_ids: vec![[4; 32], [5; 32]],
             },
             PeerMessage::GetBlock { block_id: [6; 32] },
-            PeerMessage::Block(block),
+            PeerMessage::Block(block.clone()),
+            PeerMessage::SubmitBlock(block),
+            PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                block_id,
+                status: BlockSubmissionStatus::Accepted,
+                peer_height: 1,
+                peer_tip: block_id,
+            }),
             PeerMessage::GetMempool,
             PeerMessage::TransactionInventory {
                 txids: vec![[7; 32], [8; 32]],
@@ -1231,6 +1307,16 @@ mod tests {
         assert!(matches!(
             decode_peer_frame(&trailing, NETWORK_ID),
             Err(PeerError::TrailingBytes(1))
+        ));
+
+        let mut invalid_submission = vec![0_u8; 73];
+        invalid_submission[32] = 0xff;
+        assert!(matches!(
+            decode_peer_frame(
+                &raw_frame(BLOCK_SUBMISSION_RESULT_KIND, 1, &invalid_submission),
+                NETWORK_ID
+            ),
+            Err(PeerError::InvalidBlockSubmissionStatus(0xff))
         ));
     }
 

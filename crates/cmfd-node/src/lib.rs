@@ -1748,6 +1748,38 @@ impl Node {
         inventory
     }
 
+    /// Returns active-chain identifiers after the active-chain ancestor of a
+    /// known peer tip. Unlike `inventory_after`, this accepts a known side-tip
+    /// so a one-sided static link can relay the winning local branch across an
+    /// equal-work fork without waiting for a reciprocal connection.
+    pub fn relay_inventory_after(&self, peer_tip: [u8; 32], max: usize) -> Vec<[u8; 32]> {
+        if max == 0 || !self.index.contains(peer_tip) {
+            return Vec::new();
+        }
+        let mut cursor = peer_tip;
+        let mut active_position = None;
+        for _ in 0..=self.index.blocks.len() {
+            if let Some(position) = self.index.active_position(cursor) {
+                active_position = Some(position);
+                break;
+            }
+            let Some(entry) = self.index.blocks.get(&cursor) else {
+                return Vec::new();
+            };
+            cursor = entry.parent;
+        }
+        let Some(position) = active_position else {
+            return Vec::new();
+        };
+        self.index
+            .active_chain
+            .iter()
+            .skip(position + 1)
+            .take(max)
+            .copied()
+            .collect()
+    }
+
     pub fn build_template(
         &self,
         miner_destination: [u8; 32],

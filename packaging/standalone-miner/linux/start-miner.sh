@@ -2,10 +2,12 @@
 set -euo pipefail
 
 # Edit these values. Leave GPU_INDEXES empty to use every supported GPU.
+# PEER is the node that receives your blocks and keeps this miner synced.
 PEER="107.214.187.2:18444"
 P2P_BIND="127.0.0.1:19444"
 DATA_DIR="$(cd -- "$(dirname -- "$0")" && pwd)/miner-data"
 GPU_INDEXES=""
+# PAYOUT_ADDRESS is your wallet's 64-character receive address.
 PAYOUT_ADDRESS=""
 BATCH_SIZE="8192"
 

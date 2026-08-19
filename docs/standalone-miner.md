@@ -73,8 +73,13 @@ node owns the selected data directory, so do not open the GUI wallet against
 that same directory while the miner is running. The existing wallet remains
 the Pool-mode client for this Devnet iteration.
 
-The current P2P relay is pull-based. The miner downloads blocks from its
-configured peer; for other nodes to receive blocks mined by this rig, at least
-one node must also configure this miner's reachable P2P address as a peer.
+The miner synchronizes in both directions over each configured peer session. It
+downloads newer blocks, immediately submits every locally accepted block to the
+configured node, and retries missing locally active blocks on the regular peer
+poll. A temporary disconnect therefore shows `node sync pending` rather than a
+false remote acceptance; relay catches up automatically after reconnection.
 
-Devnet CMFD is test currency with no monetary value.
+`--miner` (or `PAYOUT_ADDRESS` in the packaged launch file) selects the coinbase
+payout destination. It does not identify or locate a node. `--peer` selects the
+node that receives blocks. One outbound miner-to-node peer configuration is
+enough; the wallet/node does not also need to list the miner as a peer.

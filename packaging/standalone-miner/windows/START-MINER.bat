@@ -5,11 +5,13 @@ title Common Foundry Multi-GPU Miner
 rem ================================================================
 rem EDIT ONLY THIS SECTION
 rem ================================================================
+rem PEER is the node that receives your blocks and keeps this miner synced.
 set "PEER=107.214.187.2:18444"
 set "ALLOW_PUBLIC_PEER=1"
 set "P2P_BIND=127.0.0.1:19444"
 set "DATA_DIR=%~dp0miner-data"
 set "GPU_INDEXES="
+rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="
 set "BATCH_SIZE=8192"
 rem ================================================================
