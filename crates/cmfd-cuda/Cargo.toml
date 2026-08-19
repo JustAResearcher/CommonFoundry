@@ -1,0 +1,14 @@
+[package]
+name = "cmfd-cuda"
+version = "0.1.0-devnet.6"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cmfd-consensus = { path = "../cmfd-consensus" }
+libloading.workspace = true
+
+[lib]
+name = "cmfd_cuda"
+path = "src/lib.rs"

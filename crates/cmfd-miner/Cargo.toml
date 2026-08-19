@@ -1,0 +1,19 @@
+[package]
+name = "cmfd-miner"
+version = "0.1.0-devnet.6"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cmfd-cuda = { path = "../cmfd-cuda" }
+cmfd-consensus = { path = "../cmfd-consensus" }
+cmfd-node = { path = "../cmfd-node" }
+ctrlc.workspace = true
+hex.workspace = true
+
+[[bin]]
+name = "cmfd-miner"
+path = "src/main.rs"

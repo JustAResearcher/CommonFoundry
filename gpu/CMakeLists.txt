@@ -24,7 +24,7 @@ set_target_properties(cmfd-forgematrix-v2-cuda PROPERTIES
   CUDA_ARCHITECTURES "89;120"
 )
 set_target_properties(cmfd-forgematrix-v2-miner PROPERTIES
-  CUDA_ARCHITECTURES "75-real;86-real;89-real;120-real;75-virtual"
+  CUDA_ARCHITECTURES "70-real;75-real;86-real;89-real;120-real;70-virtual"
   CUDA_RUNTIME_LIBRARY Static
   MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   OUTPUT_NAME "cmfd-forgematrix-v2-miner"

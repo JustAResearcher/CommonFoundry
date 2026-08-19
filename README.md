@@ -64,8 +64,9 @@ To run the separate CUDA arithmetic smoke tests:
 .\scripts\test-cuda.ps1 -Version v2
 ```
 
-The optional wallet miner backend is a different, batched CUDA path. Build its
-20/30/40/50-series fat library and run the CPU/CUDA differential canary with:
+The optional miner backend is a different, batched CUDA path. Build its
+Volta and RTX 20/30/40/50-series fat library and run the CPU/CUDA differential
+canary with:
 
 ```powershell
 .\scripts\build-cuda-miner.ps1
@@ -73,6 +74,9 @@ The optional wallet miner backend is a different, batched CUDA path. Build its
 
 See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
 boundary, supported architectures, wallet packaging, and tester procedure.
+Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
+whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
+launchers.
 
 `profile16gb` reports the disabled, seed-based v1 candidate; it is not the v2
 profile. The v2 CLI/test paths are deliberately capped to tiny research shapes
