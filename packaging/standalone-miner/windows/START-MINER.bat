@@ -9,7 +9,7 @@ rem These defaults work with a wallet on this PC or the community bootstrap.
 set "LOCAL_PEER=127.0.0.1:18444"
 set "BOOTSTRAP_PEER=107.214.187.2:18444"
 set "P2P_BIND=127.0.0.1:19444"
-set "DATA_DIR=%~dp0miner-data"
+set "DATA_DIR=%LOCALAPPDATA%\Common Foundry Miner\devnet-0"
 set "GPU_INDEXES="
 rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="

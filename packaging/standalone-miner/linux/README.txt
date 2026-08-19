@@ -8,6 +8,10 @@ COMMON FOUNDRY STANDALONE CUDA MINER
 4. Edit start-miner.sh only to change GPUs or the payout address.
 5. Leave the terminal open. Press Ctrl+C to stop cleanly.
 
+The miner downloads the node's current chain before starting GPU work. Seeing
+"Syncing from ..." on the first start is normal. Chain data stays under
+XDG_DATA_HOME (or ~/.local/share) across miner upgrades.
+
 To select specific cards, use a comma-separated list:
   GPU_INDEXES="0,1,2,3"
 

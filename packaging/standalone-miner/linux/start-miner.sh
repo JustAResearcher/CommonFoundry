@@ -6,7 +6,7 @@ set -euo pipefail
 LOCAL_PEER="127.0.0.1:18444"
 BOOTSTRAP_PEER="107.214.187.2:18444"
 P2P_BIND="127.0.0.1:19444"
-DATA_DIR="$(cd -- "$(dirname -- "$0")" && pwd)/miner-data"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/common-foundry-miner/devnet-0"
 GPU_INDEXES=""
 # PAYOUT_ADDRESS is your wallet's 64-character receive address.
 PAYOUT_ADDRESS=""

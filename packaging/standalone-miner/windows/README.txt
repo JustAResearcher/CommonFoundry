@@ -7,6 +7,10 @@ COMMON FOUNDRY STANDALONE CUDA MINER
 4. To change GPUs or the payout address, right-click START-MINER.bat and Edit.
 5. Leave the miner window open. Press Ctrl+C to stop cleanly.
 
+The miner downloads the node's current chain before starting GPU work. Seeing
+"Syncing from ..." on the first start is normal. Chain data stays in your
+Windows user application-data folder across miner upgrades.
+
 To select specific cards, set GPU_INDEXES in START-MINER.bat:
   set "GPU_INDEXES=0,1,2,3"
 
