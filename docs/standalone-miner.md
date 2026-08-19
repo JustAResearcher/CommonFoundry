@@ -44,9 +44,10 @@ The Windows ZIP includes:
 - `LIST-GPUS.bat`
 - `START-MINER.bat`
 
-Run `LIST-GPUS.bat`, edit the short settings section at the top of
-`START-MINER.bat`, then launch `START-MINER.bat`. Leave `GPU_INDEXES` blank to
-use every supported card automatically.
+Run `LIST-GPUS.bat`, then launch `START-MINER.bat`. Its defaults try a GUI
+wallet on the same computer first and the community bootstrap second, so the
+peer settings normally need no editing. Leave `GPU_INDEXES` blank to use every
+supported card automatically.
 
 ## Direct commands
 
@@ -59,7 +60,7 @@ cmfd-miner devices
 Mine with every supported GPU and the community bootstrap:
 
 ```text
-cmfd-miner mine --allow-public-peers --peer 107.214.187.2:18444
+cmfd-miner mine --peer 127.0.0.1:18444 --peer 107.214.187.2:18444 --allow-public-peers
 ```
 
 Select GPUs 0, 1, and 3:
@@ -78,6 +79,9 @@ downloads newer blocks, immediately submits every locally accepted block to the
 configured node, and retries missing locally active blocks on the regular peer
 poll. A temporary disconnect therefore shows `node sync pending` rather than a
 false remote acceptance; relay catches up automatically after reconnection.
+The packaged launchers configure two peers. `node sync 1/2` means one of them is
+reachable and block relay is working; `node sync pending 0/2` means neither is
+currently reachable.
 
 `--miner` (or `PAYOUT_ADDRESS` in the packaged launch file) selects the coinbase
 payout destination. It does not identify or locate a node. `--peer` selects the

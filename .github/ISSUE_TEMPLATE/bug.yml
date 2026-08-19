@@ -11,7 +11,7 @@ body:
     attributes:
       label: Version and checksum
       description: Give the release tag and SHA-256 of the downloaded artifact.
-      placeholder: v0.1.0-devnet.7 / sha256...
+      placeholder: v0.1.0-devnet.8 / sha256...
     validations:
       required: true
   - type: dropdown

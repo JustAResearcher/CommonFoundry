@@ -1,1 +1,3 @@
 *.pdf binary
+packaging/standalone-miner/linux/start-miner.sh text eol=lf
+packaging/standalone-miner/windows/*.bat text eol=crlf
