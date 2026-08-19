@@ -55,9 +55,10 @@ Linux testers then need only the hub's public IP:
   --peer PUBLIC_IP:18444
 ```
 
-The hub's blocks and transactions are pulled by each tester. Because relay is
-pull-only, a tester who wants independently mined blocks to propagate back to
-the hub must also be reachable and configured as a reciprocal peer.
+Each configured static-peer session pulls blocks and transactions, then offers
+locally active blocks missing after the peer's advertised tip. A single
+tester-to-hub peer entry therefore synchronizes mined blocks in both directions;
+the hub does not need a reciprocal entry for that tester.
 
 The Devnet-0 P2P transport is neither authenticated nor encrypted. The public
 flag is a conspicuous, test-only opt-in; it does not provide discovery, bans,

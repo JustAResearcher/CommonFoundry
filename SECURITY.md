@@ -40,8 +40,9 @@ Mainnet remains disabled until all of the following are complete:
 Devnet-0 now has bounded static-peer sessions, full block
 validation before indexing, cumulative-chainwork fork choice and reorgs, a
 checksummed append-only block log with consensus replay, touched-state atomic
-active-chain validation, a bounded volatile mempool with pull-only static peer
-propagation, and a bounded CMFD-specific pool test protocol. Those features
+active-chain validation, bounded bidirectional block synchronization, a bounded
+volatile mempool with pull-based transaction propagation, and a bounded
+CMFD-specific pool test protocol. Those features
 make it a multi-node test harness; they do not make it safe for valuable funds.
 Loopback/private addresses remain the default. An explicit
 `--allow-public-peers` flag permits numeric public P2P addresses for bounded,

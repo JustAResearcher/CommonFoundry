@@ -35,7 +35,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
 | **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
 
-This revision describes the `v0.1.0-devnet.5` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+This revision describes the `v0.1.0-devnet.7` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
 
 This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
 
@@ -718,7 +718,11 @@ Prices are directly denominated in CMFD atoms. Volatility and hedging are outsid
 
 ### 11.1 Private static network
 
-Devnet-0 is designed for a small group of explicitly configured peers, not the public Internet. RPC is loopback-only on `127.0.0.1:18443`. P2P defaults to TCP port 18444 on an exact loopback, RFC1918, IPv6 ULA, or IPv6 link-local address. Public, unspecified, duplicate, self, and zero-port peer configurations are rejected.
+Devnet-0 is designed for a small group of explicitly configured peers. RPC is
+loopback-only on `127.0.0.1:18443`. P2P defaults to TCP port 18444 on an exact
+loopback, RFC1918, IPv6 ULA, or IPv6 link-local address. Public numeric addresses
+require explicit `--allow-public-peers` opt-in; unspecified, duplicate, self,
+and zero-port peer configurations remain rejected.
 
 Peers exchange the network identifier, consensus fingerprint, a process-scoped node nonce, tip, height, and 512-bit cumulative work. The fingerprint detects mismatches in committed network parameters; it does not authenticate the peer, encrypt traffic, or prove that two binaries implement identical semantics.
 
@@ -730,11 +734,17 @@ When one or more static peers are configured, the default live poller runs every
 4. assigns local acceptance time and fully validates it;
 5. requests deterministic mempool inventory;
 6. downloads at most 64 unknown transaction bodies;
-7. verifies each transaction ID and applies ordinary mempool admission.
+7. verifies each transaction ID and applies ordinary mempool admission;
+8. offers up to 16 locally active blocks following the peer's advertised tip;
+9. requires an explicit accepted, already-known, or rejected result for every
+   submitted block.
 
 Remote height and chainwork are hints. Local verification and locally calculated cumulative work decide acceptance.
 
-Pull-only propagation was chosen to bound unsolicited input and simplify the first private deployment. It makes convergence depend on static topology and polling, so it is not a final public gossip protocol.
+Bounded request/response synchronization was chosen to simplify the first
+deployment. Static links now move blocks in both directions, while transaction
+propagation remains pull-only. Convergence still depends on static topology and
+polling, so this is not a final public gossip protocol.
 
 ### 11.2 Persistence and crash consistency
 
@@ -1137,7 +1147,7 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.5`; the annotated Git tag identifies the exact source commit.
+10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.7`; the annotated Git tag identifies the exact source commit.
 
 ## Appendix F. Non-claims
 

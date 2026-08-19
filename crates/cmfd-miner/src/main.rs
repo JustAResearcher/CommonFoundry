@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use cmfd_cuda::{CudaDevice, CudaLibrary};
-use cmfd_node::p2p::{spawn_inbound_listener_with_policy, spawn_static_peer_polling};
+use cmfd_node::p2p::{
+    relay_blocks_to_peer_once_with_policy, spawn_inbound_listener_with_policy,
+    spawn_static_peer_polling,
+};
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::{
     MiningJob, MiningShareSearchResult, Node, parse_miner_destination, unix_time_seconds,
@@ -196,6 +199,13 @@ struct MinerOptions {
     stats_seconds: u64,
 }
 
+struct ContinuousMiningConfig {
+    payout: [u8; 32],
+    peers: StaticPeerConfig,
+    batch_size: u32,
+    stats_interval: Duration,
+}
+
 fn run_miner(options: MinerOptions) -> Result<()> {
     if options.batch_size == 0 || options.batch_size > MAX_BATCH_SIZE {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
@@ -231,17 +241,18 @@ fn run_miner(options: MinerOptions) -> Result<()> {
         limits,
         address_policy,
     )?;
-    let poller = if options.peers.is_empty() {
+    let peer_config = StaticPeerConfig {
+        listen_address: p2p_address,
+        peers: options.peers,
+        limits,
+        address_policy,
+    };
+    let poller = if peer_config.peers.is_empty() {
         None
     } else {
         Some(spawn_static_peer_polling(
             Arc::clone(&shared),
-            StaticPeerConfig {
-                listen_address: p2p_address,
-                peers: options.peers.clone(),
-                limits,
-                address_policy,
-            },
+            peer_config.clone(),
             Duration::from_secs(2),
         )?)
     };
@@ -267,9 +278,12 @@ fn run_miner(options: MinerOptions) -> Result<()> {
         Arc::clone(&shared),
         cuda,
         devices,
-        payout,
-        options.batch_size,
-        Duration::from_secs(options.stats_seconds),
+        ContinuousMiningConfig {
+            payout,
+            peers: peer_config,
+            batch_size: options.batch_size,
+            stats_interval: Duration::from_secs(options.stats_seconds),
+        },
         shutdown,
     );
     let poll_result = match poller {
@@ -287,16 +301,14 @@ fn continuous_mining(
     node: Arc<Mutex<Node>>,
     cuda: CudaLibrary,
     devices: Vec<CudaDevice>,
-    payout: [u8; 32],
-    batch_size: u32,
-    stats_interval: Duration,
+    config: ContinuousMiningConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut blocks_found = 0_u64;
     while !shutdown.load(Ordering::Acquire) {
         let job = {
             let node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
-            node.build_mining_job(payout, unix_time_seconds()?)?
+            node.build_mining_job(config.payout, unix_time_seconds()?)?
         };
         println!(
             "Mining height {} on {} GPU(s)...",
@@ -308,8 +320,8 @@ fn continuous_mining(
             cuda.clone(),
             devices.clone(),
             job,
-            batch_size,
-            stats_interval,
+            config.batch_size,
+            config.stats_interval,
             Arc::clone(&shutdown),
         )? {
             JobOutcome::Shutdown => break,
@@ -329,10 +341,37 @@ fn continuous_mining(
                 };
                 if accepted {
                     blocks_found = blocks_found.saturating_add(1);
-                    println!(
-                        "BLOCK FOUND | GPU {device} | height {height} | {} | session blocks {blocks_found}",
-                        hex::encode(block_id)
-                    );
+                    let relayed = config
+                        .peers
+                        .peers
+                        .iter()
+                        .filter(|peer| {
+                            relay_blocks_to_peer_once_with_policy(
+                                Arc::clone(&node),
+                                **peer,
+                                config.peers.limits,
+                                config.peers.address_policy,
+                            )
+                            .is_ok_and(|report| report.peer_tip == block_id)
+                        })
+                        .count();
+                    if config.peers.peers.is_empty() || relayed == config.peers.peers.len() {
+                        let relay = if config.peers.peers.is_empty() {
+                            "local mode".to_owned()
+                        } else {
+                            format!("node sync {relayed}/{}", config.peers.peers.len())
+                        };
+                        println!(
+                            "BLOCK FOUND | GPU {device} | height {height} | {} | {relay} | session blocks {blocks_found}",
+                            hex::encode(block_id)
+                        );
+                    } else {
+                        println!(
+                            "BLOCK FOUND LOCALLY | GPU {device} | height {height} | {} | node sync pending {relayed}/{} (automatic retry) | session blocks {blocks_found}",
+                            hex::encode(block_id),
+                            config.peers.peers.len()
+                        );
+                    }
                 } else {
                     println!("Candidate became stale before submission; rebuilding work.");
                 }

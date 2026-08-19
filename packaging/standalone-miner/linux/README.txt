@@ -19,7 +19,5 @@ Supported native CUDA targets:
 The miner keeps one CUDA context and one worker on each selected GPU. Work
 ranges are separated so GPUs in the same rig do not repeat one another.
 
-The miner downloads blocks from PEER. For other nodes to receive blocks mined
-by this rig, one of them must also list this miner's reachable P2P address.
-
-Devnet CMFD is test currency with no monetary value.
+The miner downloads from PEER and submits locally accepted blocks back to it.
+Temporary relay failures retry automatically; no reciprocal peer is required.

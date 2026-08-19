@@ -210,8 +210,8 @@ start RPC. Its P2P default is `127.0.0.1:18444`, so the command above assigns
 `--peer` is repeatable and uses the same private-address checks as `run`.
 For bidirectional block synchronization, launch the packaged wallet with
 `--peer 127.0.0.1:18454` as described in the desktop peer README linked above.
-Without the reciprocal wallet peer, pool shares and blocks still work on the
-pool node, but the wallet's embedded chain will not pull the pool's new blocks.
+That one static link pulls pool blocks into the wallet and offers wallet blocks
+back to the pool node; a reciprocal entry is not required.
 
 ### Pool protocol and accounting boundary
 
@@ -299,9 +299,11 @@ address.
 Each two-second peer poll performs the compatibility handshake, pulls at most
 16 blocks first, then requests the remote mempool inventory and at most 64
 unknown transaction bodies. Every returned body must match its advertised ID
-and pass the node's normal consensus and mempool admission rules. Relay is
-pull-only: there is no unsolicited push broadcast, so each destination must be
-configured to poll a source directly or through another polling node.
+and pass the node's normal consensus and mempool admission rules. After pulling,
+the same static link offers bounded locally active block batches following the
+peer's advertised tip. Each submitted block receives an accepted, already-known,
+or rejected acknowledgement after the receiving node's normal validation path.
+Transactions remain pull-only; there is no general gossip broadcast.
 
 ## Run a small direct-IP test network
 
@@ -341,12 +343,11 @@ chmod +x Common-Foundry-Wallet.AppImage
   --peer PUBLIC_IP:18444
 ```
 
-The Windows wallet can now Solo mine and the Linux wallets will pull its blocks
-on their regular peer poll. Compare block height, tip, and cumulative work on
-the Network page. Testers do not need to forward a port merely to follow the
-hub. Because propagation is pull-only, a tester who wants independently mined
-blocks to flow back must also expose a reachable P2P listener and be configured
-as a reciprocal peer.
+The Windows wallet can now Solo mine and the Linux wallets will synchronize its
+blocks on their regular peer poll. Compare block height, tip, and cumulative
+work on the Network page. That same configured connection offers independently
+mined Linux blocks back to the hub. Testers do not need to forward a port merely
+to follow or mine through the hub.
 
 `--allow-public-peers` does not add peer identity, encryption, discovery,
 automatic bans, reputation, or demonstrated DDoS resistance. Stop the public
@@ -452,7 +453,7 @@ that the confirmed transaction is absent from every volatile pool.
 
 For an isolated fork-choice exercise, start A and B without `--peer`, mine a
 different branch into each directory, and give one branch strictly more
-cumulative work. Restart both with their reciprocal peer options. Both must
+cumulative work. Restart either one with the other as a static peer. Both must
 retain a local tip on equal work and switch only when the competing branch has
 strictly greater cumulative work.
 

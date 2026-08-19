@@ -17,8 +17,8 @@ use cmfd_consensus::{Block, Transaction, WireError, decode_block};
 use thiserror::Error;
 
 use crate::peer::{
-    PeerAddressPolicy, PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
-    StaticPeerConfig,
+    BlockSubmissionResult, BlockSubmissionStatus, PeerAddressPolicy, PeerConnection, PeerError,
+    PeerHello, PeerLimits, PeerMessage, PeerSession, StaticPeerConfig,
 };
 use crate::{Node, NodeError, PeerDirection, unix_time_seconds};
 
@@ -61,6 +61,13 @@ pub enum P2pError {
         requested: [u8; 32],
         actual: [u8; 32],
     },
+    #[error("peer returned a block-submission result for {actual:?}, expected {submitted:?}")]
+    WrongBlockSubmission {
+        submitted: [u8; 32],
+        actual: [u8; 32],
+    },
+    #[error("peer rejected submitted block {0:?}")]
+    RejectedBlockSubmission([u8; 32]),
     #[error("peer inventory is not parent-ordered at block {block_id:?}")]
     NonContiguousInventory { block_id: [u8; 32] },
     #[error("peer requested an unknown or body-less block {0:?}")]
@@ -87,6 +94,16 @@ pub struct SyncReport {
     pub accepted_transactions: usize,
     pub already_known_transactions: usize,
     pub rejected_transactions: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelayReport {
+    pub remote_hello: PeerHello,
+    pub offered_blocks: usize,
+    pub accepted_blocks: usize,
+    pub already_known: usize,
+    pub peer_height: u64,
+    pub peer_tip: [u8; 32],
 }
 
 impl SyncReport {
@@ -313,6 +330,129 @@ fn perform_sync_from_peer_once_inner_with_policy(
     })
 }
 
+/// Offers up to `MAX_BLOCKS_PER_SYNC` locally active blocks that follow the
+/// peer's advertised tip. Each block is acknowledged only after the peer has
+/// passed it through its normal durable consensus path. A later poll continues
+/// from the peer's new tip, so temporary disconnects recover in bounded steps.
+pub fn relay_blocks_to_peer_once_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<RelayReport, P2pError> {
+    relay_blocks_to_peer_once_inner_with_policy(shared, address, limits, address_policy, None)
+}
+
+fn relay_blocks_to_peer_once_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<RelayReport, P2pError> {
+    let observation_address = observed_address(PeerDirection::Outbound, address);
+    record_peer_started(
+        &shared,
+        PeerDirection::Outbound,
+        observation_address.clone(),
+    );
+    let result = perform_relay_blocks_to_peer_once_inner_with_policy(
+        Arc::clone(&shared),
+        address,
+        limits,
+        address_policy,
+        nonce_override,
+    );
+    if let Ok(report) = &result {
+        record_peer_succeeded(
+            &shared,
+            PeerDirection::Outbound,
+            observation_address.clone(),
+            report.remote_hello,
+        );
+    }
+    record_peer_ended(
+        &shared,
+        PeerDirection::Outbound,
+        observation_address,
+        result.is_err(),
+    );
+    result
+}
+
+fn perform_relay_blocks_to_peer_once_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<RelayReport, P2pError> {
+    let hello = with_nonce(
+        {
+            let node = lock_node(&shared)?;
+            node.peer_hello()
+        },
+        nonce_override,
+    );
+    let network_id = hello.network_id;
+    let session = PeerSession::new(hello, limits)?;
+    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
+    connection.send_hello()?;
+    let remote_hello = expect_hello(connection.receive()?)?;
+
+    let block_ids = {
+        let node = lock_node(&shared)?;
+        node.relay_inventory_after(remote_hello.tip, MAX_BLOCKS_PER_SYNC)
+    };
+    let mut accepted_blocks = 0;
+    let mut already_known = 0;
+    let mut peer_height = remote_hello.height;
+    let mut peer_tip = remote_hello.tip;
+
+    for block_id in &block_ids {
+        let canonical = {
+            let node = lock_node(&shared)?;
+            node.canonical_block(*block_id).map(|bytes| bytes.to_vec())
+        }
+        .ok_or(P2pError::UnknownRequestedBlock(*block_id))?;
+        let block = decode_block(&canonical, network_id)?;
+        let actual = block.block_id();
+        if actual != *block_id {
+            return Err(P2pError::WrongBlock {
+                requested: *block_id,
+                actual,
+            });
+        }
+
+        connection.send(PeerMessage::SubmitBlock(block))?;
+        let result = expect_block_submission_result(connection.receive()?)?;
+        if result.block_id != *block_id {
+            return Err(P2pError::WrongBlockSubmission {
+                submitted: *block_id,
+                actual: result.block_id,
+            });
+        }
+        peer_height = result.peer_height;
+        peer_tip = result.peer_tip;
+        match result.status {
+            BlockSubmissionStatus::Accepted => accepted_blocks += 1,
+            BlockSubmissionStatus::AlreadyKnown => already_known += 1,
+            BlockSubmissionStatus::Rejected => {
+                return Err(P2pError::RejectedBlockSubmission(*block_id));
+            }
+        }
+    }
+
+    Ok(RelayReport {
+        remote_hello,
+        offered_blocks: block_ids.len(),
+        accepted_blocks,
+        already_known,
+        peer_height,
+        peer_tip,
+    })
+}
+
 /// Serves one already-accepted inbound connection until the peer closes it or
 /// violates the bounded protocol.
 pub fn respond_to_peer(
@@ -447,9 +587,33 @@ fn perform_respond_to_peer_inner_with_policy(
                 }
                 connection.send(PeerMessage::Transaction(transaction))?;
             }
+            PeerMessage::SubmitBlock(block) => {
+                let block_id = block.block_id();
+                let accepted_at = unix_time_seconds()?;
+                let status = {
+                    let mut node = lock_node(&shared)?;
+                    if node.contains_block(block_id) {
+                        BlockSubmissionStatus::AlreadyKnown
+                    } else if node.submit_block(block, accepted_at).is_ok() {
+                        BlockSubmissionStatus::Accepted
+                    } else {
+                        BlockSubmissionStatus::Rejected
+                    }
+                };
+                let peer = {
+                    let node = lock_node(&shared)?;
+                    node.peer_hello()
+                };
+                connection.send(PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                    block_id,
+                    status,
+                    peer_height: peer.height,
+                    peer_tip: peer.tip,
+                }))?;
+            }
             other => {
                 return Err(P2pError::UnexpectedMessage {
-                    expected: "GetHeaders, GetBlock, GetMempool, or GetTransaction",
+                    expected: "GetHeaders, GetBlock, GetMempool, GetTransaction, or SubmitBlock",
                     actual: message_name(&other),
                 });
             }
@@ -699,9 +863,9 @@ fn reap_workers(workers: &mut Vec<JoinHandle<()>>) {
     }
 }
 
-/// Stoppable, bounded round-robin static-peer polling. Each peer gets at most
-/// one `sync_from_peer_once` attempt per interval, and failures never suppress
-/// later peers or later rounds.
+/// Stoppable, bounded round-robin static-peer synchronization. Each interval
+/// pulls from every configured peer and then offers locally active blocks that
+/// follow that peer's tip. Failures never suppress later peers or later rounds.
 pub struct StaticPeerPollHandle {
     stop: Arc<(Mutex<bool>, Condvar)>,
     thread: Option<JoinHandle<()>>,
@@ -772,6 +936,13 @@ fn static_peer_poll_loop(
                 return;
             }
             let _ = sync_from_peer_once_inner_with_policy(
+                Arc::clone(&shared),
+                *peer,
+                config.limits,
+                config.address_policy,
+                nonce_override,
+            );
+            let _ = relay_blocks_to_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 *peer,
                 config.limits,
@@ -867,6 +1038,16 @@ fn expect_transaction(message: PeerMessage) -> Result<Transaction, P2pError> {
     }
 }
 
+fn expect_block_submission_result(message: PeerMessage) -> Result<BlockSubmissionResult, P2pError> {
+    match message {
+        PeerMessage::BlockSubmissionResult(result) => Ok(result),
+        other => Err(P2pError::UnexpectedMessage {
+            expected: "BlockSubmissionResult",
+            actual: message_name(&other),
+        }),
+    }
+}
+
 fn message_name(message: &PeerMessage) -> &'static str {
     match message {
         PeerMessage::Hello(_) => "Hello",
@@ -874,6 +1055,8 @@ fn message_name(message: &PeerMessage) -> &'static str {
         PeerMessage::Inventory { .. } => "Inventory",
         PeerMessage::GetBlock { .. } => "GetBlock",
         PeerMessage::Block(_) => "Block",
+        PeerMessage::SubmitBlock(_) => "SubmitBlock",
+        PeerMessage::BlockSubmissionResult(_) => "BlockSubmissionResult",
         PeerMessage::GetMempool => "GetMempool",
         PeerMessage::TransactionInventory { .. } => "TransactionInventory",
         PeerMessage::GetTransaction { .. } => "GetTransaction",
@@ -1522,6 +1705,198 @@ mod tests {
         listener.stop().unwrap();
         drop(source);
         clean_test_dir(&source_path);
+    }
+
+    #[test]
+    fn submitted_blocks_are_acknowledged_rejected_and_deduplicated() {
+        let source_path = test_dir("submit-source");
+        let target_path = test_dir("submit-target");
+        let source = open_shared(&source_path);
+        let target = open_shared(&target_path);
+        let block = source
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                unix_time_seconds().unwrap(),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let mut invalid = block.clone();
+        invalid.challenge.timestamp = invalid.challenge.timestamp.saturating_add(1);
+        let invalid_id = invalid.block_id();
+        let block_id = block.block_id();
+        let (listener, address) = start_listener(Arc::clone(&target), TARGET_NONCE);
+
+        let mut hello = source.lock().unwrap().peer_hello();
+        hello.node_nonce = SOURCE_NONCE;
+        let session = PeerSession::new(hello, test_limits()).unwrap();
+        let mut client = PeerConnection::connect(address, session).unwrap();
+        client.send_hello().unwrap();
+        assert!(matches!(client.receive().unwrap(), PeerMessage::Hello(_)));
+
+        client.send(PeerMessage::SubmitBlock(invalid)).unwrap();
+        assert!(matches!(
+            client.receive().unwrap(),
+            PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                block_id: returned,
+                status: BlockSubmissionStatus::Rejected,
+                peer_height: 0,
+                ..
+            }) if returned == invalid_id
+        ));
+        assert_eq!(target.lock().unwrap().peer_hello().height, 0);
+
+        client
+            .send(PeerMessage::SubmitBlock(block.clone()))
+            .unwrap();
+        assert!(matches!(
+            client.receive().unwrap(),
+            PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                block_id: returned,
+                status: BlockSubmissionStatus::Accepted,
+                peer_height: 1,
+                peer_tip,
+            }) if returned == block_id && peer_tip == block_id
+        ));
+        client.send(PeerMessage::SubmitBlock(block)).unwrap();
+        assert!(matches!(
+            client.receive().unwrap(),
+            PeerMessage::BlockSubmissionResult(BlockSubmissionResult {
+                block_id: returned,
+                status: BlockSubmissionStatus::AlreadyKnown,
+                peer_height: 1,
+                peer_tip,
+            }) if returned == block_id && peer_tip == block_id
+        ));
+
+        drop(client);
+        listener.stop().unwrap();
+        drop(source);
+        drop(target);
+        clean_test_dir(&source_path);
+        clean_test_dir(&target_path);
+    }
+
+    #[test]
+    fn one_sided_static_peer_configuration_relays_mined_blocks_outbound() {
+        let miner_path = test_dir("outbound-miner");
+        let wallet_path = test_dir("outbound-wallet");
+        let miner = open_shared(&miner_path);
+        let wallet = open_shared(&wallet_path);
+        mine(
+            &miner,
+            MAX_BLOCKS_PER_SYNC + 1,
+            unix_time_seconds().unwrap(),
+        );
+        let (listener, address) = start_listener(Arc::clone(&wallet), TARGET_NONCE);
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&miner),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28444".parse().unwrap(),
+                peers: vec![address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_millis(20),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        assert_eq!(
+            wallet.lock().unwrap().peer_hello().height,
+            (MAX_BLOCKS_PER_SYNC + 1) as u64
+        );
+
+        poller.stop().unwrap();
+        listener.stop().unwrap();
+        drop(miner);
+        drop(wallet);
+        clean_test_dir(&miner_path);
+        clean_test_dir(&wallet_path);
+    }
+
+    #[test]
+    fn one_sided_relay_crosses_an_equal_work_fork_after_local_extension() {
+        let miner_path = test_dir("fork-relay-miner");
+        let wallet_path = test_dir("fork-relay-wallet");
+        let miner = open_shared(&miner_path);
+        let wallet = open_shared(&wallet_path);
+        let now = unix_time_seconds().unwrap();
+        let miner_first = miner
+            .lock()
+            .unwrap()
+            .mine_once(default_miner_destination(), now, DEFAULT_MINING_ATTEMPTS)
+            .unwrap();
+        let wallet_first = wallet
+            .lock()
+            .unwrap()
+            .mine_once(
+                insecure_dev_destination(0x75),
+                now.saturating_add(1),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        assert_ne!(miner_first.block_id(), wallet_first.block_id());
+
+        let (listener, address) = start_listener(Arc::clone(&wallet), TARGET_NONCE);
+        let poller = spawn_static_peer_polling_inner(
+            Arc::clone(&miner),
+            StaticPeerConfig {
+                listen_address: "127.0.0.1:28445".parse().unwrap(),
+                peers: vec![address],
+                limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
+            },
+            Duration::from_millis(20),
+            Some(SOURCE_NONCE),
+        )
+        .unwrap();
+
+        let first_deadline = Instant::now() + Duration::from_secs(5);
+        while !wallet
+            .lock()
+            .unwrap()
+            .contains_block(miner_first.block_id())
+            && Instant::now() < first_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            wallet
+                .lock()
+                .unwrap()
+                .contains_block(miner_first.block_id())
+        );
+        assert!(!tips_match(&miner, &wallet));
+
+        miner
+            .lock()
+            .unwrap()
+            .mine_once(
+                default_miner_destination(),
+                now.saturating_add(2),
+                DEFAULT_MINING_ATTEMPTS,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !tips_match(&miner, &wallet) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tips_match(&miner, &wallet));
+        assert_eq!(wallet.lock().unwrap().peer_hello().height, 2);
+
+        poller.stop().unwrap();
+        listener.stop().unwrap();
+        drop(miner);
+        drop(wallet);
+        clean_test_dir(&miner_path);
+        clean_test_dir(&wallet_path);
     }
 
     #[test]
