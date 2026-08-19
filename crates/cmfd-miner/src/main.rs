@@ -454,7 +454,7 @@ fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
         limits,
         address_policy,
     }
-    .validate()?;
+    .validate_client_peers()?;
 
     let cuda = load_cuda(options.cuda_library.as_deref())?;
     let available = cuda.devices().map_err(anyhow::Error::msg)?;

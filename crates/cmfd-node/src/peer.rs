@@ -219,6 +219,15 @@ impl StaticPeerConfig {
     pub fn validate(&self) -> Result<(), PeerError> {
         self.limits.validate()?;
         validate_peer_address(self.listen_address, self.address_policy)?;
+        self.validate_peer_list(true)
+    }
+
+    pub fn validate_client_peers(&self) -> Result<(), PeerError> {
+        self.limits.validate()?;
+        self.validate_peer_list(false)
+    }
+
+    fn validate_peer_list(&self, reject_listener: bool) -> Result<(), PeerError> {
         if self.peers.len() > self.limits.max_peers {
             return Err(PeerError::TooManyPeers {
                 actual: self.peers.len(),
@@ -228,7 +237,7 @@ impl StaticPeerConfig {
         let mut unique = HashSet::with_capacity(self.peers.len());
         for peer in &self.peers {
             validate_peer_address(*peer, self.address_policy)?;
-            if *peer == self.listen_address {
+            if reject_listener && *peer == self.listen_address {
                 return Err(PeerError::ConfiguredSelfAddress(*peer));
             }
             if !unique.insert(*peer) {
@@ -1954,6 +1963,7 @@ mod tests {
         ));
         let mut self_address = valid.clone();
         self_address.peers = vec![self_address.listen_address];
+        self_address.validate_client_peers().unwrap();
         assert!(matches!(
             self_address.validate(),
             Err(PeerError::ConfiguredSelfAddress(_))
