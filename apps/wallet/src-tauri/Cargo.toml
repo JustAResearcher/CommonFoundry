@@ -18,9 +18,9 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 cmfd-consensus = { path = "../../../crates/cmfd-consensus" }
+cmfd-cuda = { path = "../../../crates/cmfd-cuda" }
 cmfd-node = { path = "../../../crates/cmfd-node" }
 hex.workspace = true
-libloading.workspace = true
 serde.workspace = true
 tauri = { version = "=2.11.5", features = [] }
 tauri-plugin-single-instance = "=2.4.3"

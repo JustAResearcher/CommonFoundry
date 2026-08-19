@@ -268,8 +268,8 @@ CMFD_CUDA_EXPORT int32_t cmfd_cuda_create(
         cuda_check(cudaSetDevice(device_index), "select CUDA device");
         cudaDeviceProp properties{};
         cuda_check(cudaGetDeviceProperties(&properties, device_index), "read CUDA device");
-        if (properties.major < 7 || (properties.major == 7 && properties.minor < 5)) {
-            throw std::runtime_error("CUDA device must support compute capability 7.5 or newer");
+        if (properties.major < 7) {
+            throw std::runtime_error("CUDA device must support compute capability 7.0 or newer");
         }
 
         auto context = std::make_unique<Context>();

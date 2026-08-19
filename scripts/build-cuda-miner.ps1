@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$BuildDirectory,
+    [string]$CudaToolkit,
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
     [switch]$SkipDifferentialTest
@@ -15,22 +16,31 @@ if (-not $BuildDirectory) {
 }
 $BuildDirectory = [System.IO.Path]::GetFullPath($BuildDirectory)
 
-$nvccCommand = Get-Command nvcc.exe -ErrorAction SilentlyContinue
-if (-not $nvccCommand) {
-    $fallback = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\nvcc.exe'
-    if (Test-Path -LiteralPath $fallback) {
-        $nvcc = $fallback
+$toolkitCandidates = @()
+if ($CudaToolkit) {
+    $toolkitCandidates += [System.IO.Path]::GetFullPath($CudaToolkit)
+}
+$toolkitCandidates += @(
+    'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9',
+    'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8'
+)
+$nvcc = $toolkitCandidates |
+    ForEach-Object { Join-Path $_ 'bin\nvcc.exe' } |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+if (-not $nvcc) {
+    $nvccCommand = Get-Command nvcc.exe -ErrorAction SilentlyContinue
+    if ($nvccCommand) {
+        $nvcc = $nvccCommand.Source
     } else {
-        throw 'nvcc.exe was not found. Install a CUDA toolkit that supports sm_120.'
+        throw 'nvcc.exe was not found. Install CUDA Toolkit 12.8 or 12.9.'
     }
-} else {
-    $nvcc = $nvccCommand.Source
 }
 
 $supported = @(& $nvcc --list-gpu-code)
-foreach ($architecture in @('sm_75', 'sm_86', 'sm_89', 'sm_120')) {
+foreach ($architecture in @('sm_70', 'sm_75', 'sm_86', 'sm_89', 'sm_120')) {
     if ($supported -notcontains $architecture) {
-        throw "The selected CUDA toolkit cannot emit $architecture. CUDA 13.2 is recommended."
+        throw "The selected CUDA toolkit cannot emit $architecture. CUDA 12.8 or 12.9 is required for one Volta-through-Blackwell library."
     }
 }
 
@@ -65,13 +75,13 @@ if (-not (Test-Path -LiteralPath $cuobjdump)) {
 }
 $nativeImages = @(& $cuobjdump --list-elf $library)
 $ptxImages = @(& $cuobjdump --list-ptx $library)
-foreach ($architecture in @('sm_75', 'sm_86', 'sm_89', 'sm_120')) {
+foreach ($architecture in @('sm_70', 'sm_75', 'sm_86', 'sm_89', 'sm_120')) {
     if (-not ($nativeImages -match [regex]::Escape($architecture))) {
         throw "The library is missing its native $architecture image."
     }
 }
-if (-not ($ptxImages -match 'sm_75')) {
-    throw 'The library is missing its forward-compatible compute_75 PTX image.'
+if (-not ($ptxImages -match 'sm_70')) {
+    throw 'The library is missing its forward-compatible compute_70 PTX image.'
 }
 
 if (-not $SkipDifferentialTest) {
@@ -107,6 +117,6 @@ $hash = -join ($digest | ForEach-Object { $_.ToString('x2') })
     Library = $file.FullName
     Bytes = $file.Length
     SHA256 = $hash
-    NativeArchitectures = 'sm_75, sm_86, sm_89, sm_120'
-    PtxFallback = 'compute_75'
+    NativeArchitectures = 'sm_70, sm_75, sm_86, sm_89, sm_120'
+    PtxFallback = 'compute_70'
 }
