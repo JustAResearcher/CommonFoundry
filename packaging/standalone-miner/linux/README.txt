@@ -1,9 +1,11 @@
 COMMON FOUNDRY STANDALONE CUDA MINER
 
-1. Open start-miner.sh in a text editor.
-2. Edit PEER and any other values at the top.
-3. Leave GPU_INDEXES empty to use every supported NVIDIA GPU.
-4. Run: chmod +x start-miner.sh && ./start-miner.sh
+1. Run: chmod +x start-miner.sh && ./start-miner.sh
+2. The defaults automatically find a wallet on this computer, or use the
+   community bootstrap when the wallet is elsewhere.
+3. No peer setting needs to be changed. Leave GPU_INDEXES empty to use every
+   supported NVIDIA GPU.
+4. Edit start-miner.sh only to change GPUs or the payout address.
 5. Leave the terminal open. Press Ctrl+C to stop cleanly.
 
 To select specific cards, use a comma-separated list:
@@ -19,5 +21,6 @@ Supported native CUDA targets:
 The miner keeps one CUDA context and one worker on each selected GPU. Work
 ranges are separated so GPUs in the same rig do not repeat one another.
 
-The miner downloads from PEER and submits locally accepted blocks back to it.
-Temporary relay failures retry automatically; no reciprocal peer is required.
+The miner first tries the local wallet at 127.0.0.1:18444, then the community
+bootstrap. A status such as "node sync 1/2" means one peer is connected and is
+working normally. Temporary relay failures retry automatically.

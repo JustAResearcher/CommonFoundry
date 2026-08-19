@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Edit these values. Leave GPU_INDEXES empty to use every supported GPU.
-# PEER is the node that receives your blocks and keeps this miner synced.
-PEER="107.214.187.2:18444"
+# These defaults work with a wallet on this computer or the community bootstrap.
+# Leave GPU_INDEXES empty to use every supported GPU.
+LOCAL_PEER="127.0.0.1:18444"
+BOOTSTRAP_PEER="107.214.187.2:18444"
 P2P_BIND="127.0.0.1:19444"
 DATA_DIR="$(cd -- "$(dirname -- "$0")" && pwd)/miner-data"
 GPU_INDEXES=""
@@ -13,8 +14,11 @@ BATCH_SIZE="8192"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 ARGS=(mine --data-dir "$DATA_DIR" --p2p-bind "$P2P_BIND" --batch-size "$BATCH_SIZE")
-if [[ -n "$PEER" ]]; then
-  ARGS+=(--peer "$PEER" --allow-public-peers)
+if [[ -n "$LOCAL_PEER" ]]; then
+  ARGS+=(--peer "$LOCAL_PEER")
+fi
+if [[ -n "$BOOTSTRAP_PEER" ]]; then
+  ARGS+=(--peer "$BOOTSTRAP_PEER" --allow-public-peers)
 fi
 if [[ -n "$GPU_INDEXES" ]]; then
   IFS=',' read -ra DEVICES <<< "$GPU_INDEXES"

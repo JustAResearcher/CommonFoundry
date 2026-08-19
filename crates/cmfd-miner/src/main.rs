@@ -725,4 +725,18 @@ mod tests {
         }
         assert_eq!(observed.len(), 12_000);
     }
+
+    #[test]
+    fn packaged_launchers_try_local_wallet_before_bootstrap() {
+        let windows = include_str!("../../../packaging/standalone-miner/windows/START-MINER.bat");
+        let linux = include_str!("../../../packaging/standalone-miner/linux/start-miner.sh");
+
+        for launcher in [windows, linux] {
+            let local = launcher.find("127.0.0.1:18444").unwrap();
+            let bootstrap = launcher.find("107.214.187.2:18444").unwrap();
+            assert!(local < bootstrap);
+            assert_eq!(launcher.matches("--peer").count(), 2);
+            assert!(launcher.contains("--allow-public-peers"));
+        }
+    }
 }

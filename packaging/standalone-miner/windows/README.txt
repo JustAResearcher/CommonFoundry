@@ -1,9 +1,10 @@
 COMMON FOUNDRY STANDALONE CUDA MINER
 
 1. Double-click LIST-GPUS.bat and confirm every NVIDIA GPU appears.
-2. Right-click START-MINER.bat and choose Edit.
-3. The default settings automatically use every supported GPU.
-4. Save the file and double-click START-MINER.bat.
+2. The defaults automatically find a wallet on this PC, or use the community
+   bootstrap when the wallet is elsewhere.
+3. Double-click START-MINER.bat. No peer setting needs to be changed.
+4. To change GPUs or the payout address, right-click START-MINER.bat and Edit.
 5. Leave the miner window open. Press Ctrl+C to stop cleanly.
 
 To select specific cards, set GPU_INDEXES in START-MINER.bat:
@@ -19,5 +20,6 @@ Supported native CUDA targets:
 The miner keeps one CUDA context and one worker on each selected GPU. Work
 ranges are separated so GPUs in the same rig do not repeat one another.
 
-The miner downloads from PEER and submits locally accepted blocks back to it.
-Temporary relay failures retry automatically; no reciprocal peer is required.
+The miner first tries the local wallet at 127.0.0.1:18444, then the community
+bootstrap. A status such as "node sync 1/2" means one peer is connected and is
+working normally. Temporary relay failures retry automatically.

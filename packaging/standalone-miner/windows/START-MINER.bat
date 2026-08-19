@@ -5,9 +5,9 @@ title Common Foundry Multi-GPU Miner
 rem ================================================================
 rem EDIT ONLY THIS SECTION
 rem ================================================================
-rem PEER is the node that receives your blocks and keeps this miner synced.
-set "PEER=107.214.187.2:18444"
-set "ALLOW_PUBLIC_PEER=1"
+rem These defaults work with a wallet on this PC or the community bootstrap.
+set "LOCAL_PEER=127.0.0.1:18444"
+set "BOOTSTRAP_PEER=107.214.187.2:18444"
 set "P2P_BIND=127.0.0.1:19444"
 set "DATA_DIR=%~dp0miner-data"
 set "GPU_INDEXES="
@@ -30,8 +30,8 @@ if not exist "%~dp0cmfd-miner.exe" (
 )
 
 set "PEER_ARGS="
-if defined PEER set "PEER_ARGS=--peer %PEER%"
-if "%ALLOW_PUBLIC_PEER%"=="1" set "PEER_ARGS=!PEER_ARGS! --allow-public-peers"
+if defined LOCAL_PEER set "PEER_ARGS=--peer %LOCAL_PEER%"
+if defined BOOTSTRAP_PEER set "PEER_ARGS=!PEER_ARGS! --peer %BOOTSTRAP_PEER% --allow-public-peers"
 
 set "DEVICE_ARGS="
 if defined GPU_INDEXES (
@@ -43,7 +43,8 @@ set "PAYOUT_ARGS="
 if defined PAYOUT_ADDRESS set "PAYOUT_ARGS=--miner %PAYOUT_ADDRESS%"
 
 echo Starting Common Foundry miner...
-echo Peer: %PEER%
+echo Local wallet peer: %LOCAL_PEER%
+echo Bootstrap fallback: %BOOTSTRAP_PEER%
 if defined GPU_INDEXES (
   echo GPUs: %GPU_INDEXES%
 ) else (
