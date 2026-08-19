@@ -444,11 +444,15 @@ fn continuous_mining(
                             .is_ok_and(|report| report.peer_tip == block_id)
                         })
                         .count();
-                    if config.peers.peers.is_empty() || relayed == config.peers.peers.len() {
-                        let relay = if config.peers.peers.is_empty() {
-                            "local mode".to_owned()
-                        } else {
-                            format!("node sync {relayed}/{}", config.peers.peers.len())
+                    if config.peers.peers.is_empty() || relayed > 0 {
+                        let relay = match (relayed, config.peers.peers.len()) {
+                            (_, 0) => "local mode".to_owned(),
+                            (relayed, total) if relayed == total => {
+                                format!("node sync {relayed}/{total}")
+                            }
+                            (relayed, total) => format!(
+                                "node sync {relayed}/{total} (other peers retry automatically)"
+                            ),
                         };
                         println!(
                             "BLOCK FOUND | GPU {device} | height {height} | {} | {relay} | session blocks {blocks_found}",
