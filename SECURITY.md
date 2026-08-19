@@ -72,9 +72,12 @@ command allowlist to its bundled webview. It does not open the loopback HTTP RPC
 listener. The browser developer workflow still uses the loopback Vite proxy and
 inherits the RPC limitations documented in the Devnet guide.
 
-Continuous desktop mining uses the tiny CPU full-recomputation profile. Its
-performance counter is a count of complete ForgeMatrix nonce evaluations, not
-a GPU hashrate or proof of physical VRAM residency.
+Continuous desktop mining uses the tiny full-recomputation Devnet profile. It
+can optionally delegate the INT8 matrix stage to a CUDA library, but Rust fully
+recomputes every below-target candidate before block submission or pool credit.
+The performance counter is complete ForgeMatrix nonce evaluations, not raw GPU
+TOPS or proof of physical VRAM residency. A missing or failed CUDA backend falls
+back to the CPU evaluator and is reported in wallet status.
 
 The Devnet pool is a CMFD-specific length-bounded job/share protocol over TLS
 1.3; it is not Stratum. A client authenticates the server by comparing the

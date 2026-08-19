@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../../../target/gpu-miner-build/cmfd-forgematrix-v2-miner.dll": "cmfd-forgematrix-v2-miner.dll"
+    }
+  }
+}

@@ -64,6 +64,16 @@ To run the separate CUDA arithmetic smoke tests:
 .\scripts\test-cuda.ps1 -Version v2
 ```
 
+The optional wallet miner backend is a different, batched CUDA path. Build its
+20/30/40/50-series fat library and run the CPU/CUDA differential canary with:
+
+```powershell
+.\scripts\build-cuda-miner.ps1
+```
+
+See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
+boundary, supported architectures, wallet packaging, and tester procedure.
+
 `profile16gb` reports the disabled, seed-based v1 candidate; it is not the v2
 profile. The v2 CLI/test paths are deliberately capped to tiny research shapes
 so every vector can be recomputed quickly on an ordinary CPU.
@@ -114,11 +124,13 @@ requests under `/rpc` to `http://127.0.0.1:18443`; the node RPC is not exposed
 directly to the browser or public network.
 
 The wallet reads real active-chain balances and history, displays the receive
-destination, creates signed sends, runs a cancellable continuous Devnet
-reference solo miner, and consolidates mining outputs through the embedded
-node. Mining reports exact ForgeMatrix matrix evaluations per second, not a
-GPU hashrate. Mined rewards require 100 confirmations before they are
-spendable. Consolidation selects mature, unreserved outputs in smallest-first
+destination, creates signed sends, runs cancellable continuous Solo or Pool
+mining, and consolidates mining outputs through the embedded node. With the
+optional CUDA library present, the wallet accelerates the INT8 matrix stage on
+one NVIDIA GPU; otherwise it uses the CPU reference evaluator. Every CUDA
+candidate is fully recomputed in Rust before submission. Mining reports
+complete ForgeMatrix nonce attempts per second, not raw GPU TOPS. Mined rewards
+require 100 confirmations before they are spendable. Consolidation selects mature, unreserved outputs in smallest-first
 order, accepts 2 through 128 inputs, creates one wallet output, and burns the
 chosen transaction fee.
 

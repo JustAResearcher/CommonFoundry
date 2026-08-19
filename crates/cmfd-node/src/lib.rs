@@ -12,7 +12,8 @@ use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
 use cmfd_consensus::{
     BLOCK_VERSION, Block, BlockChallenge, BlockProof, BlockValidationContext, COIN, ChainError,
     ChainState, Coinbase, ConsensusPowVerifier, DEFAULT_MONETARY_POLICY, EconomicsError,
-    FixedRewardDestinations, ForgeMatrixError, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
+    FixedRewardDestinations, ForgeMatrixError, ForgeMatrixV2AcceleratorBatch,
+    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, InputWitness, MAX_BLOCK_BYTES,
     MAX_FUTURE_OFFSET_SECS, MAX_TRANSACTION_BYTES, MAX_TRANSACTION_INPUTS,
     NETWORK_PROTOCOL_VERSION, NetworkError, NetworkParams, OutPoint, OutputLock, PowError,
     PowParameters, TRANSACTION_VERSION, Transaction, TxInput, TxOutput, WireError, add_chain_work,
@@ -325,6 +326,98 @@ impl MiningJob {
     /// The immutable consensus challenge represented by this job.
     pub fn challenge(&self) -> &BlockChallenge {
         &self.template.challenge
+    }
+
+    pub fn accelerator_model(&self) -> Result<ForgeMatrixV2AcceleratorModel, NodeError> {
+        Ok(self.verifier.v2_accelerator_model()?)
+    }
+
+    pub fn prepare_accelerator_batch(
+        &self,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV2AcceleratorBatch, NodeError> {
+        Ok(self.verifier.prepare_v2_accelerator_batch(
+            &self.template.challenge,
+            start_nonce,
+            count,
+        )?)
+    }
+
+    /// Full-recomputation differential check for one untrusted accelerator
+    /// output. This does not apply a target and is intended for startup/canary
+    /// validation of an optional backend.
+    pub fn verify_accelerator_output(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        index: usize,
+        output: &[u8],
+    ) -> Result<[u8; 32], NodeError> {
+        self.verifier
+            .validate_v2_accelerator_batch(&self.template.challenge, batch)?;
+        let work_digest = batch
+            .candidate_work_digest(index, output)
+            .map_err(PowError::from)?;
+        self.verifier.verify_v2_accelerator_candidate(
+            &self.template.challenge,
+            batch,
+            index,
+            work_digest,
+        )?;
+        Ok(work_digest)
+    }
+
+    /// Scans untrusted accelerator outputs, then fully recomputes the first
+    /// claimed below-target nonce before returning it. Outputs are one
+    /// canonical final activation per nonce in batch order.
+    pub fn complete_accelerator_batch(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        outputs: &[u8],
+        share_target: [u8; 32],
+    ) -> Result<MiningShareSearchResult, NodeError> {
+        self.validate_share_target(share_target)?;
+        self.verifier
+            .validate_v2_accelerator_batch(&self.template.challenge, batch)?;
+        let expected_len = batch
+            .count()
+            .checked_mul(batch.activation_len() as u32)
+            .map(|length| length as usize)
+            .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+        if outputs.len() != expected_len {
+            return Err(NodeError::Pow(PowError::V2(
+                ForgeMatrixV2Error::AcceleratorOutputShape,
+            )));
+        }
+
+        for (index, output) in outputs.chunks_exact(batch.activation_len()).enumerate() {
+            let work_digest = batch
+                .candidate_work_digest(index, output)
+                .map_err(PowError::from)?;
+            if work_digest <= share_target {
+                let proof = self.verifier.verify_v2_accelerator_candidate(
+                    &self.template.challenge,
+                    batch,
+                    index,
+                    work_digest,
+                )?;
+                let nonce = batch
+                    .nonce_at(index)
+                    .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+                return Ok(MiningShareSearchResult::Found {
+                    proof,
+                    work_digest,
+                    meets_chain_target: work_digest <= self.template.challenge.target,
+                    attempts_completed: index as u64 + 1,
+                    next_nonce: nonce.wrapping_add(1),
+                });
+            }
+        }
+
+        Ok(MiningShareSearchResult::Exhausted {
+            attempts_completed: batch.count().into(),
+            next_nonce: batch.start_nonce().wrapping_add(u64::from(batch.count())),
+        })
     }
 
     /// Searches a bounded wrapping nonce range without accessing mutable node
@@ -3567,6 +3660,56 @@ mod tests {
             }
         }
 
+        clean_test_dir(&path);
+    }
+
+    #[test]
+    fn accelerator_outputs_are_prefiltered_but_never_trusted() {
+        let path = test_dir("accelerator-recheck");
+        clean_test_dir(&path);
+        let node = Node::open(&path).unwrap();
+        let job = node
+            .build_mining_job(default_miner_destination(), 1_800_000_000)
+            .unwrap();
+        drop(node);
+
+        let batch = job.prepare_accelerator_batch(17, 2).unwrap();
+        let reference = v2_test_reference().unwrap();
+        let mut outputs = Vec::new();
+        for index in 0..batch.count() as usize {
+            let proof = reference
+                .prove_reference(job.challenge(), batch.nonce_at(index).unwrap())
+                .unwrap();
+            outputs.extend(
+                proof
+                    .layers
+                    .last()
+                    .unwrap()
+                    .output
+                    .iter()
+                    .map(|value| u8::try_from(*value + 125).unwrap()),
+            );
+        }
+
+        let result = job
+            .complete_accelerator_batch(&batch, &outputs, [0xff; 32])
+            .unwrap();
+        assert!(matches!(
+            result,
+            MiningShareSearchResult::Found {
+                attempts_completed: 1,
+                next_nonce: 18,
+                ..
+            }
+        ));
+
+        outputs[0] = (outputs[0] + 1) % 251;
+        assert!(matches!(
+            job.complete_accelerator_batch(&batch, &outputs, [0xff; 32]),
+            Err(NodeError::Pow(PowError::V2(
+                ForgeMatrixV2Error::AcceleratorMismatch
+            )))
+        ));
         clean_test_dir(&path);
     }
 

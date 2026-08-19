@@ -111,10 +111,12 @@ CORS headers.
 The GUI uses the node's active chain and mempool rather than sample data. It
 shows balances and transaction history, displays and copies the receive
 destination, signs and submits sends, and can run a continuous, cancellable
-solo miner against the tiny CPU reference profile. Its reported rate is exact
-ForgeMatrix matrix evaluations per second. It is not an optimized GPU rate,
-and the software does not prove physical GPU or VRAM use. Transaction fees are
-burned. Mined rewards remain immature for 100 confirmations and cannot be
+Solo or Pool miner against the tiny reference profile. An optional CUDA backend
+accelerates its exact INT8 matrix stage on one supported NVIDIA GPU; Rust
+recomputes every below-target candidate before it is submitted or credited. Its
+reported rate is complete ForgeMatrix nonce evaluations per second, not raw GPU
+TOPS, and the software does not prove physical GPU or VRAM use. See
+[ForgeMatrix v2 CUDA miner](cuda-miner.md). Transaction fees are burned. Mined rewards remain immature for 100 confirmations and cannot be
 spent or consolidated before then.
 
 The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the

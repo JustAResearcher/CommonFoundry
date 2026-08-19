@@ -1,7 +1,7 @@
 {
   "name": "@common-foundry/wallet",
   "private": true,
-  "version": "0.1.0-devnet.3",
+  "version": "0.1.0-devnet.4",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
@@ -12,7 +12,9 @@
     "test": "vitest run",
     "preview": "vite preview --host 127.0.0.1",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "cuda:build:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File ../../scripts/build-cuda-miner.ps1",
+    "desktop:build:cuda:windows": "npm run cuda:build:windows && tauri build --config src-tauri/tauri.cuda.windows.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",

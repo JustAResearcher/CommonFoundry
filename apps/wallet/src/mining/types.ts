@@ -1,4 +1,5 @@
 export type MiningMode = "solo" | "pool";
+export type MiningEngine = "cpu" | "cuda";
 
 export type MiningLifecycle =
   | "stopped"
@@ -25,6 +26,8 @@ export interface MiningStatus {
   payout: string | null;
   pool_url: string | null;
   worker_name: string | null;
+  engine: MiningEngine;
+  device: string | null;
   matrix_attempts_per_second: number;
   session_attempts: number;
   blocks_found: number;
