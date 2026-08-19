@@ -132,6 +132,19 @@ pub fn sync_from_peer_once(
     sync_from_peer_once_inner(shared, address, limits, None)
 }
 
+/// Performs one bounded pull using the explicitly selected address policy.
+///
+/// Public Devnet peers remain rejected unless the caller has deliberately
+/// selected [`PeerAddressPolicy::AllowPublic`].
+pub fn sync_from_peer_once_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<SyncReport, P2pError> {
+    sync_from_peer_once_inner_with_policy(shared, address, limits, address_policy, None)
+}
+
 fn sync_from_peer_once_inner(
     shared: Arc<Mutex<Node>>,
     address: SocketAddr,

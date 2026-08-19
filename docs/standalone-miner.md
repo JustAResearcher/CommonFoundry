@@ -47,7 +47,9 @@ The Windows ZIP includes:
 Run `LIST-GPUS.bat`, then launch `START-MINER.bat`. Its defaults try a GUI
 wallet on the same computer first and the community bootstrap second, so the
 peer settings normally need no editing. Leave `GPU_INDEXES` blank to use every
-supported card automatically.
+supported card automatically. Miner chain data is stored under the current
+user's application-data directory, so installing or extracting a later miner
+release does not start over from height zero.
 
 ## Direct commands
 
@@ -75,10 +77,13 @@ that same directory while the miner is running. The existing wallet remains
 the Pool-mode client for this Devnet iteration.
 
 The miner synchronizes in both directions over each configured peer session. It
-downloads newer blocks, immediately submits every locally accepted block to the
-configured node, and retries missing locally active blocks on the regular peer
-poll. A temporary disconnect therefore shows `node sync pending` rather than a
-false remote acceptance; relay catches up automatically after reconnection.
+downloads and validates the selected node's active chain before starting any
+GPU work, immediately submits every locally accepted block to the configured
+node, and retries missing locally active blocks on the regular peer poll. The
+first start can therefore show `Syncing from ...` while it catches up; that is
+normal, and `Mining height ...` appears only after synchronization completes.
+A temporary disconnect shows `node sync pending` rather than a false remote
+acceptance; relay catches up automatically after reconnection.
 The packaged launchers configure two peers. `node sync 1/2` means one of them is
 reachable and block relay is working; `node sync pending 0/2` means neither is
 currently reachable.

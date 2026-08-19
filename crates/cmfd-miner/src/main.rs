@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use cmfd_cuda::{CudaDevice, CudaLibrary};
 use cmfd_node::p2p::{
     relay_blocks_to_peer_once_with_policy, spawn_inbound_listener_with_policy,
-    spawn_static_peer_polling,
+    spawn_static_peer_polling, sync_from_peer_once_with_policy,
 };
 use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 use cmfd_node::{
@@ -24,6 +24,7 @@ const DEFAULT_MINER_P2P_ADDRESS: &str = "127.0.0.1:19444";
 const DEFAULT_BATCH_SIZE: u32 = 8_192;
 const MAX_BATCH_SIZE: u32 = 65_536;
 const DEFAULT_STATS_SECONDS: u64 = 5;
+const PEER_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -247,15 +248,6 @@ fn run_miner(options: MinerOptions) -> Result<()> {
         limits,
         address_policy,
     };
-    let poller = if peer_config.peers.is_empty() {
-        None
-    } else {
-        Some(spawn_static_peer_polling(
-            Arc::clone(&shared),
-            peer_config.clone(),
-            Duration::from_secs(2),
-        )?)
-    };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_handler = Arc::clone(&shutdown);
@@ -273,6 +265,22 @@ fn run_miner(options: MinerOptions) -> Result<()> {
         println!("  GPU {}: {}", device.index, device.label());
     }
     println!("Press Ctrl+C to stop.\n");
+
+    if !synchronize_before_mining(Arc::clone(&shared), &peer_config, &shutdown)? {
+        let _ = inbound.stop();
+        println!("Miner stopped.");
+        return Ok(());
+    }
+
+    let poller = if peer_config.peers.is_empty() {
+        None
+    } else {
+        Some(spawn_static_peer_polling(
+            Arc::clone(&shared),
+            peer_config.clone(),
+            Duration::from_secs(2),
+        )?)
+    };
 
     let mining_result = continuous_mining(
         Arc::clone(&shared),
@@ -295,6 +303,87 @@ fn run_miner(options: MinerOptions) -> Result<()> {
     poll_result?;
     inbound_result?;
     Ok(())
+}
+
+fn synchronize_before_mining(
+    node: Arc<Mutex<Node>>,
+    config: &StaticPeerConfig,
+    shutdown: &AtomicBool,
+) -> Result<bool> {
+    if config.peers.is_empty() {
+        return Ok(true);
+    }
+
+    println!("Synchronizing miner node before starting GPU work...");
+    let mut selected_peer = None;
+    let mut last_reported = None;
+
+    while !shutdown.load(Ordering::Acquire) {
+        let candidates: Vec<_> = selected_peer
+            .into_iter()
+            .chain(
+                config
+                    .peers
+                    .iter()
+                    .copied()
+                    .filter(|peer| Some(*peer) != selected_peer),
+            )
+            .collect();
+        let mut reachable = false;
+
+        for peer in candidates {
+            match sync_from_peer_once_with_policy(
+                Arc::clone(&node),
+                peer,
+                config.limits,
+                config.address_policy,
+            ) {
+                Ok(report) => {
+                    reachable = true;
+                    selected_peer = Some(peer);
+                    let local = node
+                        .lock()
+                        .map_err(|_| anyhow!("node mutex is poisoned"))?
+                        .peer_hello();
+                    if local.cumulative_work >= report.remote_hello.cumulative_work {
+                        println!(
+                            "Node synchronized with {peer} at height {}. Starting GPUs.\n",
+                            local.height
+                        );
+                        return Ok(true);
+                    }
+                    let progress = (local.height, report.remote_hello.height);
+                    if last_reported != Some(progress) {
+                        println!(
+                            "Syncing from {peer}: height {} of {}...",
+                            local.height, report.remote_hello.height
+                        );
+                        last_reported = Some(progress);
+                    }
+                    break;
+                }
+                Err(_) => {
+                    if selected_peer == Some(peer) {
+                        selected_peer = None;
+                    }
+                }
+            }
+        }
+
+        if !reachable {
+            println!(
+                "Waiting for a configured node; retrying in {} seconds...",
+                PEER_RETRY_INTERVAL.as_secs()
+            );
+            for _ in 0..(PEER_RETRY_INTERVAL.as_millis() / 100) {
+                if shutdown.load(Ordering::Acquire) {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn continuous_mining(
@@ -355,11 +444,15 @@ fn continuous_mining(
                             .is_ok_and(|report| report.peer_tip == block_id)
                         })
                         .count();
-                    if config.peers.peers.is_empty() || relayed == config.peers.peers.len() {
-                        let relay = if config.peers.peers.is_empty() {
-                            "local mode".to_owned()
-                        } else {
-                            format!("node sync {relayed}/{}", config.peers.peers.len())
+                    if config.peers.peers.is_empty() || relayed > 0 {
+                        let relay = match (relayed, config.peers.peers.len()) {
+                            (_, 0) => "local mode".to_owned(),
+                            (relayed, total) if relayed == total => {
+                                format!("node sync {relayed}/{total}")
+                            }
+                            (relayed, total) => format!(
+                                "node sync {relayed}/{total} (other peers retry automatically)"
+                            ),
                         };
                         println!(
                             "BLOCK FOUND | GPU {device} | height {height} | {} | {relay} | session blocks {blocks_found}",
@@ -738,5 +831,9 @@ mod tests {
             assert_eq!(launcher.matches("--peer").count(), 2);
             assert!(launcher.contains("--allow-public-peers"));
         }
+        assert!(windows.contains("%LOCALAPPDATA%\\Common Foundry Miner\\devnet-0"));
+        assert!(
+            linux.contains("${XDG_DATA_HOME:-$HOME/.local/share}/common-foundry-miner/devnet-0")
+        );
     }
 }
