@@ -9,15 +9,23 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use cmfd_consensus::BlockProof;
 use cmfd_cuda::{CudaDevice, CudaLibrary};
 use cmfd_node::p2p::{
-    relay_blocks_to_peer_once_with_policy, spawn_inbound_listener_with_policy,
-    spawn_static_peer_polling, sync_from_peer_once_with_policy,
+    relay_blocks_to_peer_once_with_policy, request_mining_template_once_with_policy,
+    spawn_inbound_listener_with_policy, spawn_static_peer_polling,
+    submit_mined_block_once_with_policy, sync_from_peer_once_with_policy,
 };
-use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
+use cmfd_node::peer::{
+    BlockSubmissionStatus, MiningTemplate, PeerAddressPolicy, PeerLimits, StaticPeerConfig,
+};
 use cmfd_node::{
-    MiningJob, MiningShareSearchResult, Node, parse_miner_destination, unix_time_seconds,
+    MiningShareSearchResult, MiningWork, Node, parse_miner_destination, unix_time_seconds,
 };
+
+mod telemetry;
+
+use telemetry::{GpuTelemetry, query_nvidia_smi};
 
 const DEFAULT_MINER_DATA_DIR: &str = "commonfoundry-miner-devnet0";
 const DEFAULT_MINER_P2P_ADDRESS: &str = "127.0.0.1:19444";
@@ -45,8 +53,32 @@ enum Command {
         #[arg(long)]
         cuda_library: Option<PathBuf>,
     },
-    /// Run continuous solo mining with an embedded Devnet node.
+    /// Mine node-provided templates without maintaining another chain database.
     Mine {
+        /// Devnet node that provides jobs and accepts blocks. Repeat for failover.
+        #[arg(long = "peer")]
+        peers: Vec<SocketAddr>,
+        /// Allow numeric public peer addresses for Devnet testing.
+        #[arg(long)]
+        allow_public_peers: bool,
+        /// CUDA device index. Repeat to select several; omitted means every supported GPU.
+        #[arg(long = "device")]
+        devices: Vec<i32>,
+        /// Path to the ForgeMatrix CUDA library. Defaults beside this executable.
+        #[arg(long)]
+        cuda_library: Option<PathBuf>,
+        /// Nonces evaluated per CUDA launch, from 1 through 65536.
+        #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
+        batch_size: u32,
+        /// 32-byte x-only Schnorr payout key as 64 hexadecimal characters.
+        #[arg(long)]
+        miner: Option<String>,
+        /// Seconds between rig-rate reports.
+        #[arg(long, default_value_t = DEFAULT_STATS_SECONDS)]
+        stats_seconds: u64,
+    },
+    /// Mine with an embedded full node and local chain database.
+    FullNode {
         #[arg(long, default_value = DEFAULT_MINER_DATA_DIR)]
         data_dir: PathBuf,
         #[arg(long, default_value = DEFAULT_MINER_P2P_ADDRESS)]
@@ -86,7 +118,7 @@ enum WorkerMessage {
     },
     Found {
         device: i32,
-        block: Box<cmfd_consensus::Block>,
+        proof: BlockProof,
         attempts: u64,
     },
     Failed {
@@ -96,12 +128,17 @@ enum WorkerMessage {
 }
 
 enum JobOutcome {
-    Found {
-        device: i32,
-        block: Box<cmfd_consensus::Block>,
-    },
+    Found { device: i32, proof: BlockProof },
     Stale,
+    Disconnected,
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkStatus {
+    Current,
+    Stale,
+    Disconnected,
 }
 
 struct WorkerSet {
@@ -114,7 +151,7 @@ struct WorkerSpec {
     device: CudaDevice,
     ordinal: usize,
     worker_count: usize,
-    job: MiningJob,
+    work: MiningWork,
     batch_size: u32,
 }
 
@@ -134,6 +171,23 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Devices { cuda_library } => list_devices(cuda_library.as_deref()),
         Command::Mine {
+            peers,
+            allow_public_peers,
+            devices,
+            cuda_library,
+            batch_size,
+            miner,
+            stats_seconds,
+        } => run_thin_miner(ThinMinerOptions {
+            peers,
+            allow_public_peers,
+            requested_devices: devices,
+            cuda_library,
+            batch_size,
+            miner,
+            stats_seconds,
+        }),
+        Command::FullNode {
             data_dir,
             p2p_bind,
             peers,
@@ -143,7 +197,7 @@ fn main() -> Result<()> {
             batch_size,
             miner,
             stats_seconds,
-        } => run_miner(MinerOptions {
+        } => run_full_node_miner(FullNodeMinerOptions {
             data_dir,
             p2p_bind,
             peers,
@@ -188,7 +242,17 @@ fn list_devices(path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-struct MinerOptions {
+struct ThinMinerOptions {
+    peers: Vec<SocketAddr>,
+    allow_public_peers: bool,
+    requested_devices: Vec<i32>,
+    cuda_library: Option<PathBuf>,
+    batch_size: u32,
+    miner: Option<String>,
+    stats_seconds: u64,
+}
+
+struct FullNodeMinerOptions {
     data_dir: PathBuf,
     p2p_bind: SocketAddr,
     peers: Vec<SocketAddr>,
@@ -207,13 +271,468 @@ struct ContinuousMiningConfig {
     stats_interval: Duration,
 }
 
-fn run_miner(options: MinerOptions) -> Result<()> {
-    if options.batch_size == 0 || options.batch_size > MAX_BATCH_SIZE {
+#[derive(Clone, Copy)]
+struct JobMiningConfig {
+    batch_size: u32,
+    stats_interval: Duration,
+}
+
+struct MonitorControl {
+    stats_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+    worker_cancel: Arc<AtomicBool>,
+}
+
+struct SessionStatistics {
+    started_at: Instant,
+    last_report: Instant,
+    totals: BTreeMap<i32, u64>,
+    last_totals: BTreeMap<i32, u64>,
+    blocks_found: u64,
+    stale_jobs: u64,
+    telemetry_warning_printed: bool,
+}
+
+impl SessionStatistics {
+    fn new(devices: &[CudaDevice]) -> Self {
+        let totals: BTreeMap<_, _> = devices.iter().map(|device| (device.index, 0_u64)).collect();
+        Self {
+            started_at: Instant::now(),
+            last_report: Instant::now(),
+            last_totals: totals.clone(),
+            totals,
+            blocks_found: 0,
+            stale_jobs: 0,
+            telemetry_warning_printed: false,
+        }
+    }
+
+    fn record_attempts(&mut self, device: i32, attempts: u64) {
+        let total = self.totals.entry(device).or_default();
+        *total = total.saturating_add(attempts);
+    }
+
+    fn report_if_due(&mut self, devices: &[CudaDevice], height: u64, interval: Duration) {
+        if self.last_report.elapsed() < interval {
+            return;
+        }
+
+        let report_at = Instant::now();
+        let elapsed = report_at
+            .duration_since(self.last_report)
+            .as_secs_f64()
+            .max(f64::EPSILON);
+        let rates: BTreeMap<_, _> = devices
+            .iter()
+            .map(|device| {
+                let total = self.totals.get(&device.index).copied().unwrap_or_default();
+                let previous = self
+                    .last_totals
+                    .get(&device.index)
+                    .copied()
+                    .unwrap_or_default();
+                (
+                    device.index,
+                    total.saturating_sub(previous) as f64 / elapsed,
+                )
+            })
+            .collect();
+        let telemetry = match query_nvidia_smi() {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                if !self.telemetry_warning_printed {
+                    println!(
+                        "NVIDIA telemetry unavailable ({error}); hashrate reporting will continue."
+                    );
+                    self.telemetry_warning_printed = true;
+                }
+                BTreeMap::new()
+            }
+        };
+        let total_rate = rates.values().sum::<f64>();
+        let rig_power = devices
+            .iter()
+            .map(|device| telemetry.get(&device.index)?.power_watts)
+            .sum::<Option<f64>>();
+        let rig_efficiency = rig_power
+            .filter(|power| *power > 0.0)
+            .map(|power| total_rate / power);
+        let total_attempts = self
+            .totals
+            .values()
+            .fold(0_u64, |total, attempts| total.saturating_add(*attempts));
+
+        println!(
+            "MINER STATS | height {height} | uptime {} | blocks {} | stale jobs {} | attempts {}",
+            format_duration(self.started_at.elapsed()),
+            self.blocks_found,
+            self.stale_jobs,
+            total_attempts
+        );
+        println!(
+            "  RIG   | {:.2} H/s | {} | {}",
+            total_rate,
+            format_metric(rig_power, "W"),
+            format_metric(rig_efficiency, "H/W")
+        );
+        for device in devices {
+            let rate = rates.get(&device.index).copied().unwrap_or_default();
+            println!(
+                "  GPU {:>2} | {:.2} H/s | {}",
+                device.index,
+                rate,
+                format_gpu_telemetry(rate, telemetry.get(&device.index))
+            );
+            self.last_totals.insert(
+                device.index,
+                self.totals.get(&device.index).copied().unwrap_or_default(),
+            );
+        }
+        self.last_report = report_at;
+    }
+}
+
+fn format_gpu_telemetry(rate: f64, telemetry: Option<&GpuTelemetry>) -> String {
+    let Some(telemetry) = telemetry else {
+        return "power N/A | efficiency N/A | sensors N/A".to_owned();
+    };
+    let efficiency = telemetry
+        .power_watts
+        .filter(|power| *power > 0.0)
+        .map(|power| rate / power);
+    let power = match (telemetry.power_watts, telemetry.power_limit_watts) {
+        (Some(draw), Some(limit)) => format!("{draw:.2}/{limit:.2} W"),
+        (Some(draw), None) => format!("{draw:.2} W"),
+        (None, _) => "N/A W".to_owned(),
+    };
+    let memory = match (telemetry.memory_used_mib, telemetry.memory_total_mib) {
+        (Some(used), Some(total)) => format!("{used:.0}/{total:.0} MiB"),
+        _ => "N/A".to_owned(),
+    };
+    format!(
+        "{power} | {} | temp {} | fan {} | util {} | core {} | mem {} | VRAM {memory}",
+        format_metric(efficiency, "H/W"),
+        format_metric(telemetry.temperature_celsius, "C"),
+        format_metric(telemetry.fan_percent, "%"),
+        format_metric(telemetry.utilization_percent, "%"),
+        format_metric(telemetry.graphics_clock_mhz, "MHz"),
+        format_metric(telemetry.memory_clock_mhz, "MHz"),
+    )
+}
+
+fn format_metric(value: Option<f64>, unit: &str) -> String {
+    value.map_or_else(|| "N/A".to_owned(), |value| format!("{value:.2} {unit}"))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+fn run_thin_miner(options: ThinMinerOptions) -> Result<()> {
+    validate_mining_controls(options.batch_size, options.stats_seconds)?;
+    if options.peers.is_empty() {
+        bail!("thin mining requires at least one --peer node address");
+    }
+    let payout = options
+        .miner
+        .as_deref()
+        .ok_or_else(|| anyhow!("thin mining requires --miner with your wallet receive address"))
+        .and_then(|value| parse_miner_destination(value).map_err(anyhow::Error::from))?;
+    let address_policy = if options.allow_public_peers {
+        PeerAddressPolicy::AllowPublic
+    } else {
+        PeerAddressPolicy::PrivateOnly
+    };
+    let limits = PeerLimits::default();
+    StaticPeerConfig {
+        listen_address: DEFAULT_MINER_P2P_ADDRESS.parse()?,
+        peers: options.peers.clone(),
+        limits,
+        address_policy,
+    }
+    .validate()?;
+
+    let cuda = load_cuda(options.cuda_library.as_deref())?;
+    let available = cuda.devices().map_err(anyhow::Error::msg)?;
+    let devices = select_devices(&available, &options.requested_devices)?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || shutdown_handler.store(true, Ordering::Release))?;
+
+    println!(
+        "Common Foundry thin CUDA miner v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("CUDA library: {}", cuda.path().display());
+    println!("Payout: {}", hex::encode(payout));
+    println!("Configured node(s):");
+    for peer in &options.peers {
+        println!("  {peer}");
+    }
+    println!("Using {} GPU(s):", devices.len());
+    for device in &devices {
+        println!("  GPU {}: {}", device.index, device.label());
+    }
+    println!("Hashrate unit: 1 H/s = 1 complete ForgeMatrix nonce evaluation per second.");
+    println!("The connected node owns synchronization, templates, and block acceptance.");
+    println!("Press Ctrl+C to stop.\n");
+
+    let mut statistics = SessionStatistics::new(&devices);
+    let mut preferred_peer = None;
+    while !shutdown.load(Ordering::Acquire) {
+        let Some((source, template, remote_height)) = wait_for_template(
+            &options.peers,
+            preferred_peer,
+            payout,
+            limits,
+            address_policy,
+            &shutdown,
+        )?
+        else {
+            break;
+        };
+        preferred_peer = Some(source);
+        let parent = template.challenge.previous_block;
+        let height = template.challenge.height;
+        let work = MiningWork::from_devnet_challenge(template.challenge)?;
+        println!(
+            "Connected to {source} at node height {remote_height}. Mining height {height} on {} GPU(s)...",
+            devices.len()
+        );
+
+        let mut last_node_check = Instant::now();
+        let outcome = mine_work(
+            cuda.clone(),
+            devices.clone(),
+            work,
+            JobMiningConfig {
+                batch_size: options.batch_size,
+                stats_interval: Duration::from_secs(options.stats_seconds),
+            },
+            Arc::clone(&shutdown),
+            &mut statistics,
+            &mut || {
+                if last_node_check.elapsed() < PEER_RETRY_INTERVAL {
+                    return Ok(WorkStatus::Current);
+                }
+                last_node_check = Instant::now();
+                match fetch_template_from_any(
+                    &options.peers,
+                    preferred_peer,
+                    payout,
+                    limits,
+                    address_policy,
+                ) {
+                    Some((peer, response)) => {
+                        preferred_peer = Some(peer);
+                        if response.template.challenge.previous_block == parent {
+                            Ok(WorkStatus::Current)
+                        } else {
+                            Ok(WorkStatus::Stale)
+                        }
+                    }
+                    None => Ok(WorkStatus::Disconnected),
+                }
+            },
+        )?;
+
+        match outcome {
+            JobOutcome::Shutdown => break,
+            JobOutcome::Stale => {
+                statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                println!("Node tip changed; rebuilding work.");
+            }
+            JobOutcome::Disconnected => {
+                println!("Node connection lost; GPU work paused until a node is reachable.");
+            }
+            JobOutcome::Found { device, proof } => {
+                let block = template.into_block(proof);
+                let block_id = block.block_id();
+                let mut acknowledged = 0_usize;
+                let mut rejected = 0_usize;
+                for peer in ordered_peers(&options.peers, preferred_peer) {
+                    match submit_mined_block_once_with_policy(
+                        peer,
+                        block.clone(),
+                        limits,
+                        address_policy,
+                    ) {
+                        Ok(result) if block_is_active_acknowledgement(&result, block_id) => {
+                            acknowledged += 1;
+                            preferred_peer = Some(peer);
+                        }
+                        Ok(_) => rejected += 1,
+                        Err(_) => {}
+                    }
+                }
+                if acknowledged > 0 {
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
+                    println!(
+                        "BLOCK ACCEPTED | GPU {device} | height {height} | {} | node acknowledgement {acknowledged}/{} | session blocks {}",
+                        hex::encode(block_id),
+                        options.peers.len(),
+                        statistics.blocks_found
+                    );
+                } else if rejected > 0 {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Block candidate was rejected as stale; rebuilding work.");
+                } else {
+                    println!(
+                        "Block found, but every node disconnected before acceptance; retrying."
+                    );
+                    retry_found_block(
+                        &options.peers,
+                        &mut preferred_peer,
+                        block,
+                        limits,
+                        address_policy,
+                        &shutdown,
+                        &mut statistics,
+                        device,
+                    )?;
+                }
+            }
+        }
+    }
+    println!("Miner stopped.");
+    Ok(())
+}
+
+fn validate_mining_controls(batch_size: u32, stats_seconds: u64) -> Result<()> {
+    if batch_size == 0 || batch_size > MAX_BATCH_SIZE {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
     }
-    if options.stats_seconds == 0 {
+    if stats_seconds == 0 {
         bail!("--stats-seconds must be greater than zero");
     }
+    Ok(())
+}
+
+fn ordered_peers(peers: &[SocketAddr], preferred: Option<SocketAddr>) -> Vec<SocketAddr> {
+    preferred
+        .into_iter()
+        .chain(
+            peers
+                .iter()
+                .copied()
+                .filter(|peer| Some(*peer) != preferred),
+        )
+        .collect()
+}
+
+fn block_is_active_acknowledgement(
+    result: &cmfd_node::peer::BlockSubmissionResult,
+    block_id: [u8; 32],
+) -> bool {
+    matches!(
+        result.status,
+        BlockSubmissionStatus::Accepted | BlockSubmissionStatus::AlreadyKnown
+    ) && result.block_id == block_id
+        && result.peer_tip == block_id
+}
+
+fn fetch_template_from_any(
+    peers: &[SocketAddr],
+    preferred: Option<SocketAddr>,
+    payout: [u8; 32],
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Option<(SocketAddr, cmfd_node::p2p::MiningTemplateResponse)> {
+    ordered_peers(peers, preferred)
+        .into_iter()
+        .find_map(|peer| {
+            request_mining_template_once_with_policy(peer, payout, limits, address_policy)
+                .ok()
+                .map(|response| (peer, response))
+        })
+}
+
+fn wait_for_template(
+    peers: &[SocketAddr],
+    preferred: Option<SocketAddr>,
+    payout: [u8; 32],
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    shutdown: &AtomicBool,
+) -> Result<Option<(SocketAddr, MiningTemplate, u64)>> {
+    while !shutdown.load(Ordering::Acquire) {
+        if let Some((peer, response)) =
+            fetch_template_from_any(peers, preferred, payout, limits, address_policy)
+        {
+            return Ok(Some((
+                peer,
+                response.template,
+                response.remote_hello.height,
+            )));
+        }
+        println!(
+            "Waiting for a configured node; retrying in {} seconds...",
+            PEER_RETRY_INTERVAL.as_secs()
+        );
+        if !interruptible_wait(PEER_RETRY_INTERVAL, shutdown) {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retry_found_block(
+    peers: &[SocketAddr],
+    preferred: &mut Option<SocketAddr>,
+    block: cmfd_consensus::Block,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    shutdown: &AtomicBool,
+    statistics: &mut SessionStatistics,
+    device: i32,
+) -> Result<()> {
+    while !shutdown.load(Ordering::Acquire) {
+        for peer in ordered_peers(peers, *preferred) {
+            match submit_mined_block_once_with_policy(peer, block.clone(), limits, address_policy) {
+                Ok(result) if block_is_active_acknowledgement(&result, block.block_id()) => {
+                    *preferred = Some(peer);
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
+                    println!(
+                        "BLOCK ACCEPTED | GPU {device} | height {} | {} | node {peer} | session blocks {}",
+                        block.challenge.height,
+                        hex::encode(block.block_id()),
+                        statistics.blocks_found
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Block candidate was rejected as stale; rebuilding work.");
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
+        }
+        if !interruptible_wait(PEER_RETRY_INTERVAL, shutdown) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn interruptible_wait(duration: Duration, shutdown: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+fn run_full_node_miner(options: FullNodeMinerOptions) -> Result<()> {
+    validate_mining_controls(options.batch_size, options.stats_seconds)?;
 
     let cuda = load_cuda(options.cuda_library.as_deref())?;
     let available = cuda.devices().map_err(anyhow::Error::msg)?;
@@ -264,6 +783,7 @@ fn run_miner(options: MinerOptions) -> Result<()> {
     for device in &devices {
         println!("  GPU {}: {}", device.index, device.label());
     }
+    println!("Hashrate unit: 1 H/s = 1 complete ForgeMatrix nonce evaluation per second.");
     println!("Press Ctrl+C to stop.\n");
 
     if !synchronize_before_mining(Arc::clone(&shared), &peer_config, &shutdown)? {
@@ -393,7 +913,7 @@ fn continuous_mining(
     config: ContinuousMiningConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut blocks_found = 0_u64;
+    let mut statistics = SessionStatistics::new(&devices);
     while !shutdown.load(Ordering::Acquire) {
         let job = {
             let node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
@@ -404,18 +924,44 @@ fn continuous_mining(
             job.challenge().height,
             devices.len()
         );
-        match mine_job(
-            Arc::clone(&node),
+        let expected_parent = hex::encode(job.challenge().previous_block);
+        match mine_work(
             cuda.clone(),
             devices.clone(),
-            job,
-            config.batch_size,
-            config.stats_interval,
+            job.work(),
+            JobMiningConfig {
+                batch_size: config.batch_size,
+                stats_interval: config.stats_interval,
+            },
             Arc::clone(&shutdown),
+            &mut statistics,
+            &mut || {
+                let current_tip = node
+                    .lock()
+                    .map_err(|_| anyhow!("node mutex is poisoned"))?
+                    .status()?
+                    .tip;
+                if current_tip == expected_parent {
+                    Ok(WorkStatus::Current)
+                } else {
+                    Ok(WorkStatus::Stale)
+                }
+            },
         )? {
             JobOutcome::Shutdown => break,
-            JobOutcome::Stale => println!("New chain tip received; rebuilding work."),
-            JobOutcome::Found { device, block } => {
+            JobOutcome::Disconnected => {
+                println!("Embedded node became unavailable; rebuilding work.");
+            }
+            JobOutcome::Stale => {
+                statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                println!("New chain tip received; rebuilding work.");
+            }
+            JobOutcome::Found { device, proof } => {
+                let Some(block) = job.build_block_if_chain_valid(&proof)? else {
+                    statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                    println!("Candidate no longer met the chain target; rebuilding work.");
+                    continue;
+                };
                 let block_id = block.block_id();
                 let height = block.challenge.height;
                 let expected_parent = hex::encode(block.challenge.previous_block);
@@ -429,7 +975,7 @@ fn continuous_mining(
                     }
                 };
                 if accepted {
-                    blocks_found = blocks_found.saturating_add(1);
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
                     let relayed = config
                         .peers
                         .peers
@@ -456,13 +1002,15 @@ fn continuous_mining(
                         };
                         println!(
                             "BLOCK FOUND | GPU {device} | height {height} | {} | {relay} | session blocks {blocks_found}",
-                            hex::encode(block_id)
+                            hex::encode(block_id),
+                            blocks_found = statistics.blocks_found
                         );
                     } else {
                         println!(
                             "BLOCK FOUND LOCALLY | GPU {device} | height {height} | {} | node sync pending {relayed}/{} (automatic retry) | session blocks {blocks_found}",
                             hex::encode(block_id),
-                            config.peers.peers.len()
+                            config.peers.peers.len(),
+                            blocks_found = statistics.blocks_found
                         );
                     }
                 } else {
@@ -475,14 +1023,14 @@ fn continuous_mining(
     Ok(())
 }
 
-fn mine_job(
-    node: Arc<Mutex<Node>>,
+fn mine_work(
     cuda: CudaLibrary,
     devices: Vec<CudaDevice>,
-    job: MiningJob,
-    batch_size: u32,
-    stats_interval: Duration,
+    work: MiningWork,
+    config: JobMiningConfig,
     shutdown: Arc<AtomicBool>,
+    statistics: &mut SessionStatistics,
+    check_status: &mut dyn FnMut() -> Result<WorkStatus>,
 ) -> Result<JobOutcome> {
     let worker_cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(devices.len().saturating_mul(4).max(4));
@@ -496,8 +1044,8 @@ fn mine_job(
                     device: device.clone(),
                     ordinal,
                     worker_count: devices.len(),
-                    job: job.clone(),
-                    batch_size,
+                    work: work.clone(),
+                    batch_size: config.batch_size,
                 },
                 Arc::clone(&worker_cancel),
                 sender.clone(),
@@ -511,13 +1059,16 @@ fn mine_job(
     };
 
     let outcome = monitor_workers(
-        node,
         &devices,
-        &job,
+        &work,
         &receiver,
-        stats_interval,
-        shutdown,
-        worker_cancel,
+        MonitorControl {
+            stats_interval: config.stats_interval,
+            shutdown,
+            worker_cancel,
+        },
+        statistics,
+        check_status,
     );
     workers.stop()?;
     outcome
@@ -548,16 +1099,16 @@ fn run_worker(
     sender: &SyncSender<WorkerMessage>,
 ) -> Result<(), String> {
     let model = spec
-        .job
+        .work
         .accelerator_model()
         .map_err(|error| error.client_error().message)?;
     let mut miner = spec.cuda.create(&model, spec.device.index)?;
     let canary = spec
-        .job
+        .work
         .prepare_accelerator_batch(spec.ordinal as u64, 1)
         .map_err(|error| error.client_error().message)?;
     let canary_output = miner.evaluate(&canary)?;
-    spec.job
+    spec.work
         .verify_accelerator_output(&canary, 0, &canary_output)
         .map_err(|error| {
             format!(
@@ -576,27 +1127,22 @@ fn run_worker(
     let mut pending_attempts = 0_u64;
     while !cancel.load(Ordering::Acquire) {
         let batch = spec
-            .job
+            .work
             .prepare_accelerator_batch(next_nonce, spec.batch_size)
             .map_err(|error| error.client_error().message)?;
         let outputs = miner.evaluate(&batch)?;
         pending_attempts = pending_attempts.saturating_add(u64::from(spec.batch_size));
         let result = spec
-            .job
-            .complete_accelerator_batch(&batch, &outputs, spec.job.challenge().target)
+            .work
+            .complete_accelerator_batch(&batch, &outputs)
             .map_err(|error| error.client_error().message)?;
         match result {
             MiningShareSearchResult::Found { proof, .. } => {
-                let block = spec
-                    .job
-                    .build_block_if_chain_valid(&proof)
-                    .map_err(|error| error.client_error().message)?
-                    .ok_or_else(|| "CUDA candidate did not meet the chain target".to_owned())?;
                 cancel.store(true, Ordering::Release);
                 sender
                     .send(WorkerMessage::Found {
                         device: spec.device.index,
-                        block,
+                        proof,
                         attempts: pending_attempts,
                     })
                     .map_err(|_| "miner coordinator closed before block submission".to_owned())?;
@@ -621,23 +1167,18 @@ fn run_worker(
 }
 
 fn monitor_workers(
-    node: Arc<Mutex<Node>>,
     devices: &[CudaDevice],
-    job: &MiningJob,
+    work: &MiningWork,
     receiver: &Receiver<WorkerMessage>,
-    stats_interval: Duration,
-    shutdown: Arc<AtomicBool>,
-    worker_cancel: Arc<AtomicBool>,
+    control: MonitorControl,
+    statistics: &mut SessionStatistics,
+    check_status: &mut dyn FnMut() -> Result<WorkStatus>,
 ) -> Result<JobOutcome> {
     let mut ready = BTreeSet::new();
-    let mut totals: BTreeMap<i32, u64> = devices.iter().map(|device| (device.index, 0)).collect();
-    let mut last_totals = totals.clone();
-    let mut last_report = Instant::now();
-    let expected_parent = hex::encode(job.challenge().previous_block);
 
     loop {
-        if shutdown.load(Ordering::Acquire) {
-            worker_cancel.store(true, Ordering::Release);
+        if control.shutdown.load(Ordering::Acquire) {
+            control.worker_cancel.store(true, Ordering::Release);
             return Ok(JobOutcome::Shutdown);
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -650,27 +1191,19 @@ fn monitor_workers(
                 );
             }
             Ok(WorkerMessage::Progress { device, attempts }) => {
-                *totals.entry(device).or_default() = totals
-                    .get(&device)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(attempts);
+                statistics.record_attempts(device, attempts);
             }
             Ok(WorkerMessage::Found {
                 device,
-                block,
+                proof,
                 attempts,
             }) => {
-                *totals.entry(device).or_default() = totals
-                    .get(&device)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(attempts);
-                worker_cancel.store(true, Ordering::Release);
-                return Ok(JobOutcome::Found { device, block });
+                statistics.record_attempts(device, attempts);
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::Found { device, proof });
             }
             Ok(WorkerMessage::Failed { device, error }) => {
-                worker_cancel.store(true, Ordering::Release);
+                control.worker_cancel.store(true, Ordering::Release);
                 bail!("GPU {device} failed: {error}");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -679,35 +1212,18 @@ fn monitor_workers(
             }
         }
 
-        if last_report.elapsed() >= stats_interval {
-            let elapsed = last_report.elapsed().as_secs_f64().max(f64::EPSILON);
-            let mut total_rate = 0.0;
-            let mut details = Vec::with_capacity(devices.len());
-            for device in devices {
-                let total = totals.get(&device.index).copied().unwrap_or_default();
-                let previous = last_totals.get(&device.index).copied().unwrap_or_default();
-                let rate = total.saturating_sub(previous) as f64 / elapsed;
-                total_rate += rate;
-                details.push(format!("GPU {}: {:.2} eval/s", device.index, rate));
-                last_totals.insert(device.index, total);
-            }
-            println!(
-                "Rig: {:.2} eval/s | {} | total attempts {}",
-                total_rate,
-                details.join(" | "),
-                totals.values().copied().sum::<u64>()
-            );
-            last_report = Instant::now();
-        }
+        statistics.report_if_due(devices, work.challenge().height, control.stats_interval);
 
-        let current_tip = node
-            .lock()
-            .map_err(|_| anyhow!("node mutex is poisoned"))?
-            .status()?
-            .tip;
-        if current_tip != expected_parent {
-            worker_cancel.store(true, Ordering::Release);
-            return Ok(JobOutcome::Stale);
+        match check_status()? {
+            WorkStatus::Current => {}
+            WorkStatus::Stale => {
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::Stale);
+            }
+            WorkStatus::Disconnected => {
+                control.worker_cancel.store(true, Ordering::Release);
+                return Ok(JobOutcome::Disconnected);
+            }
         }
     }
 }
@@ -820,7 +1336,65 @@ mod tests {
     }
 
     #[test]
-    fn packaged_launchers_try_local_wallet_before_bootstrap() {
+    fn telemetry_format_reports_power_efficiency_and_sensors() {
+        let telemetry = GpuTelemetry {
+            power_watts: Some(250.0),
+            power_limit_watts: Some(300.0),
+            temperature_celsius: Some(64.0),
+            fan_percent: Some(52.0),
+            utilization_percent: Some(99.0),
+            graphics_clock_mhz: Some(2_745.0),
+            memory_clock_mhz: Some(10_501.0),
+            memory_used_mib: Some(2_048.0),
+            memory_total_mib: Some(24_564.0),
+        };
+
+        let rendered = format_gpu_telemetry(1_000.0, Some(&telemetry));
+        assert!(rendered.contains("250.00/300.00 W"));
+        assert!(rendered.contains("4.00 H/W"));
+        assert!(rendered.contains("temp 64.00 C"));
+        assert!(rendered.contains("fan 52.00 %"));
+        assert!(rendered.contains("util 99.00 %"));
+        assert!(rendered.contains("core 2745.00 MHz"));
+        assert!(rendered.contains("mem 10501.00 MHz"));
+        assert!(rendered.contains("VRAM 2048/24564 MiB"));
+        assert_eq!(
+            format_gpu_telemetry(1_000.0, None),
+            "power N/A | efficiency N/A | sensors N/A"
+        );
+    }
+
+    #[test]
+    fn duration_format_does_not_wrap_after_one_day() {
+        assert_eq!(format_duration(Duration::from_secs(93_784)), "26:03:04");
+    }
+
+    #[test]
+    fn only_an_active_tip_acknowledgement_counts_as_a_mined_block() {
+        let block_id = [7; 32];
+        let active = cmfd_node::peer::BlockSubmissionResult {
+            block_id,
+            status: BlockSubmissionStatus::Accepted,
+            peer_height: 1,
+            peer_tip: block_id,
+        };
+        assert!(block_is_active_acknowledgement(&active, block_id));
+
+        let side_branch = cmfd_node::peer::BlockSubmissionResult {
+            peer_tip: [8; 32],
+            ..active
+        };
+        assert!(!block_is_active_acknowledgement(&side_branch, block_id));
+
+        let rejected = cmfd_node::peer::BlockSubmissionResult {
+            status: BlockSubmissionStatus::Rejected,
+            ..active
+        };
+        assert!(!block_is_active_acknowledgement(&rejected, block_id));
+    }
+
+    #[test]
+    fn packaged_launchers_use_thin_mining_with_local_wallet_then_bootstrap() {
         let windows = include_str!("../../../packaging/standalone-miner/windows/START-MINER.bat");
         let linux = include_str!("../../../packaging/standalone-miner/linux/start-miner.sh");
 
@@ -830,10 +1404,12 @@ mod tests {
             assert!(local < bootstrap);
             assert_eq!(launcher.matches("--peer").count(), 2);
             assert!(launcher.contains("--allow-public-peers"));
+            assert!(launcher.contains("--stats-seconds"));
+            assert!(launcher.contains("PAYOUT_ADDRESS"));
+            assert!(!launcher.contains("--data-dir"));
+            assert!(!launcher.contains("--p2p-bind"));
         }
-        assert!(windows.contains("%LOCALAPPDATA%\\Common Foundry Miner\\devnet-0"));
-        assert!(
-            linux.contains("${XDG_DATA_HOME:-$HOME/.local/share}/common-foundry-miner/devnet-0")
-        );
+        assert!(windows.contains("if not defined PAYOUT_ADDRESS"));
+        assert!(linux.contains("if [[ -z \"$PAYOUT_ADDRESS\" ]]"));
     }
 }

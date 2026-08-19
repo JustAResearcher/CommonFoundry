@@ -1,15 +1,16 @@
 COMMON FOUNDRY STANDALONE CUDA MINER
 
 1. Double-click LIST-GPUS.bat and confirm every NVIDIA GPU appears.
-2. The defaults automatically find a wallet on this PC, or use the community
-   bootstrap when the wallet is elsewhere.
-3. Double-click START-MINER.bat. No peer setting needs to be changed.
-4. To change GPUs or the payout address, right-click START-MINER.bat and Edit.
+2. Open your wallet's Receive page and copy its 64-character address.
+3. Right-click START-MINER.bat, choose Edit, and paste that address into
+   PAYOUT_ADDRESS near the top. The node addresses normally need no changes.
+4. Double-click START-MINER.bat.
 5. Leave the miner window open. Press Ctrl+C to stop cleanly.
 
-The miner downloads the node's current chain before starting GPU work. Seeing
-"Syncing from ..." on the first start is normal. Chain data stays in your
-Windows user application-data folder across miner upgrades.
+The miner requests current work directly from the first reachable node. It does
+not download or maintain another copy of the blockchain. The connected wallet
+or node performs synchronization, builds templates, validates blocks, and
+records accepted rewards for PAYOUT_ADDRESS.
 
 To select specific cards, set GPU_INDEXES in START-MINER.bat:
   set "GPU_INDEXES=0,1,2,3"
@@ -24,6 +25,16 @@ Supported native CUDA targets:
 The miner keeps one CUDA context and one worker on each selected GPU. Work
 ranges are separated so GPUs in the same rig do not repeat one another.
 
+Every five seconds the miner prints rig and per-GPU hashrate, power draw,
+hashes per watt, temperature, fan, utilization, clocks, VRAM use, uptime,
+attempts, accepted blocks, and stale jobs. One H/s means one complete
+ForgeMatrix nonce evaluation per second. Sensors that a card does not expose
+show N/A and do not interrupt mining. Edit STATS_SECONDS in START-MINER.bat to
+change the reporting interval.
+
 The miner first tries the local wallet at 127.0.0.1:18444, then the community
-bootstrap. A status such as "node sync 1/2" means one peer is connected and is
-working normally. Temporary relay failures retry automatically.
+bootstrap. It pauses GPU work when neither node is reachable, rebuilds work when
+the node tip changes, and reports a block only after a node acknowledges it.
+
+Advanced operators who intentionally want a second full node can run
+"cmfd-miner full-node --help". Normal mining should use START-MINER.bat.

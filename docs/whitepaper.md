@@ -35,7 +35,7 @@ This paper uses the following labels as protocol terms:
 | **Production proposal** | Specified research design that is not accepted by current consensus and must not be represented as deployed. |
 | **Activation gate** | A measurable requirement that must be met before a production profile can be enabled. |
 
-This revision describes the `v0.1.0-devnet.9` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
+This revision describes the `v0.1.0-devnet.10` research prerelease; its annotated release tag identifies the exact source commit. Devnet-0 uses a tiny ForgeMatrix v2 descriptor with batch 2, dimension 4, and 4 layers. Its 177-byte proof payload, or 193 bytes as a standalone framed proof, is a serialized claim rather than a succinct cryptographic proof: validators recompute the entire tiny relation from the pinned model. The candidate production descriptor with batch 128, dimension 4096, and 384 layers is rejected by code.
 
 This white paper describes the intended system, the rationale behind its choices, the exact consensus relations already specified, and the unresolved work. It does not offer CMFD for sale, promise financial returns, or assert that the current network is safe for real value.
 
@@ -741,6 +741,16 @@ When one or more static peers are configured, the default live poller runs every
 
 Remote height and chainwork are hints. Local verification and locally calculated cumulative work decide acceptance.
 
+The standalone multi-GPU miner uses the same bounded peer transport as a thin
+client. It requests a complete template keyed to its payout destination,
+evaluates only the immutable `BlockChallenge`, inserts the resulting proof, and
+submits the canonical block. It does not maintain a chain database. The node
+retains mempool selection, chain synchronization, consensus validation,
+durability, and fork choice. A miner reports success only after a node returns
+an accepted or already-known acknowledgement. This separation avoids turning
+every mining rig into an additional syncing node while preserving full node
+validation of untrusted miner output.
+
 Bounded request/response synchronization was chosen to simplify the first
 deployment. Static links now move blocks in both directions, while transaction
 propagation remains pull-only. Convergence still depends on static topology and
@@ -930,7 +940,7 @@ an SBOM, signed provenance, or an attestation.
 | Matrix sumcheck | Standalone small educational skeleton | Batched GKR, openings, ranges, 128-bit aggregate soundness |
 | Final digest | Fully replayed on tiny profile | In-proof hash, public bytes, or new proof-native digest |
 | CUDA | Tiny arithmetic differential smoke fixture | Independent optimized miner/prover and hardware matrix |
-| P2P | Bounded static private pull | Authenticated public discovery/gossip and DoS defenses |
+| P2P | Bounded static private pull plus thin-miner template/submission messages | Authenticated public discovery/gossip and DoS defenses |
 | Storage | Checksummed append, fsync, deterministic replay | Snapshots, pruning, repair, indexing, bounded startup |
 | Mempool | Deterministic capped confirmed-input pool | Fee-burn inclusion/eviction economics and package policy |
 | Pool | Pinned-TLS CMFD job/share transport, server replay, volatile bounded counters | Unique custody, persistent reorg-aware ledger, payouts, optimized proofs and DoS hardening |
@@ -1147,7 +1157,7 @@ The funding output contains the exact deposit and a `channel_id` commitment. Ful
 7. Bitcoin Improvement Proposal 340, *Schnorr Signatures for secp256k1*. https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki
 8. BLAKE3 team, *BLAKE3 Specification*. https://github.com/BLAKE3-team/BLAKE3-specs
 9. Srinath Setty, *Nova: Recursive Zero-Knowledge Arguments from Folding Schemes*, 2021. https://eprint.iacr.org/2021/370.pdf
-10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.9`; the annotated Git tag identifies the exact source commit.
+10. Common Foundry source and specifications, research prerelease `v0.1.0-devnet.10`; the annotated Git tag identifies the exact source commit.
 
 ## Appendix F. Non-claims
 

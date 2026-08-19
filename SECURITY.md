@@ -100,6 +100,14 @@ certificate SHA-256 pin. Both client and server accept only numeric loopback,
 RFC1918 IPv4, or IPv6 unique-local endpoints. TLS protects this one pool
 connection; it does not encrypt or authenticate the separate P2P protocol.
 
+The standalone miner's normal mode is a thin P2P client. A node supplies the
+complete block template, including the payout-bound coinbase, and validates the
+returned canonical block. The miner validates the Devnet network, configured
+proof system, target bound, and CUDA result before submission, but it does not
+independently maintain chain state. Treat templates as untrusted work and keep
+the node's ordinary consensus validation on every submitted block. The legacy
+`full-node` miner mode remains available for diagnostics only.
+
 Each pool job binds its identifier to an immutable `BlockChallenge` and a
 separate easier share target. Relation evaluation is deliberately targetless:
 the server reconstructs the proof and work digest for the submitted nonce,
