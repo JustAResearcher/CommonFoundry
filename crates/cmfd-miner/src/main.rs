@@ -19,6 +19,10 @@ use cmfd_node::{
     MiningJob, MiningShareSearchResult, Node, parse_miner_destination, unix_time_seconds,
 };
 
+mod telemetry;
+
+use telemetry::{GpuTelemetry, query_nvidia_smi};
+
 const DEFAULT_MINER_DATA_DIR: &str = "commonfoundry-miner-devnet0";
 const DEFAULT_MINER_P2P_ADDRESS: &str = "127.0.0.1:19444";
 const DEFAULT_BATCH_SIZE: u32 = 8_192;
@@ -207,6 +211,167 @@ struct ContinuousMiningConfig {
     stats_interval: Duration,
 }
 
+#[derive(Clone, Copy)]
+struct JobMiningConfig {
+    batch_size: u32,
+    stats_interval: Duration,
+}
+
+struct MonitorControl {
+    stats_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+    worker_cancel: Arc<AtomicBool>,
+}
+
+struct SessionStatistics {
+    started_at: Instant,
+    last_report: Instant,
+    totals: BTreeMap<i32, u64>,
+    last_totals: BTreeMap<i32, u64>,
+    blocks_found: u64,
+    stale_jobs: u64,
+    telemetry_warning_printed: bool,
+}
+
+impl SessionStatistics {
+    fn new(devices: &[CudaDevice]) -> Self {
+        let totals: BTreeMap<_, _> = devices.iter().map(|device| (device.index, 0_u64)).collect();
+        Self {
+            started_at: Instant::now(),
+            last_report: Instant::now(),
+            last_totals: totals.clone(),
+            totals,
+            blocks_found: 0,
+            stale_jobs: 0,
+            telemetry_warning_printed: false,
+        }
+    }
+
+    fn record_attempts(&mut self, device: i32, attempts: u64) {
+        let total = self.totals.entry(device).or_default();
+        *total = total.saturating_add(attempts);
+    }
+
+    fn report_if_due(&mut self, devices: &[CudaDevice], height: u64, interval: Duration) {
+        if self.last_report.elapsed() < interval {
+            return;
+        }
+
+        let report_at = Instant::now();
+        let elapsed = report_at
+            .duration_since(self.last_report)
+            .as_secs_f64()
+            .max(f64::EPSILON);
+        let rates: BTreeMap<_, _> = devices
+            .iter()
+            .map(|device| {
+                let total = self.totals.get(&device.index).copied().unwrap_or_default();
+                let previous = self
+                    .last_totals
+                    .get(&device.index)
+                    .copied()
+                    .unwrap_or_default();
+                (
+                    device.index,
+                    total.saturating_sub(previous) as f64 / elapsed,
+                )
+            })
+            .collect();
+        let telemetry = match query_nvidia_smi() {
+            Ok(telemetry) => telemetry,
+            Err(error) => {
+                if !self.telemetry_warning_printed {
+                    println!(
+                        "NVIDIA telemetry unavailable ({error}); hashrate reporting will continue."
+                    );
+                    self.telemetry_warning_printed = true;
+                }
+                BTreeMap::new()
+            }
+        };
+        let total_rate = rates.values().sum::<f64>();
+        let rig_power = devices
+            .iter()
+            .map(|device| telemetry.get(&device.index)?.power_watts)
+            .sum::<Option<f64>>();
+        let rig_efficiency = rig_power
+            .filter(|power| *power > 0.0)
+            .map(|power| total_rate / power);
+        let total_attempts = self
+            .totals
+            .values()
+            .fold(0_u64, |total, attempts| total.saturating_add(*attempts));
+
+        println!(
+            "MINER STATS | height {height} | uptime {} | blocks {} | stale jobs {} | attempts {}",
+            format_duration(self.started_at.elapsed()),
+            self.blocks_found,
+            self.stale_jobs,
+            total_attempts
+        );
+        println!(
+            "  RIG   | {:.2} H/s | {} | {}",
+            total_rate,
+            format_metric(rig_power, "W"),
+            format_metric(rig_efficiency, "H/W")
+        );
+        for device in devices {
+            let rate = rates.get(&device.index).copied().unwrap_or_default();
+            println!(
+                "  GPU {:>2} | {:.2} H/s | {}",
+                device.index,
+                rate,
+                format_gpu_telemetry(rate, telemetry.get(&device.index))
+            );
+            self.last_totals.insert(
+                device.index,
+                self.totals.get(&device.index).copied().unwrap_or_default(),
+            );
+        }
+        self.last_report = report_at;
+    }
+}
+
+fn format_gpu_telemetry(rate: f64, telemetry: Option<&GpuTelemetry>) -> String {
+    let Some(telemetry) = telemetry else {
+        return "power N/A | efficiency N/A | sensors N/A".to_owned();
+    };
+    let efficiency = telemetry
+        .power_watts
+        .filter(|power| *power > 0.0)
+        .map(|power| rate / power);
+    let power = match (telemetry.power_watts, telemetry.power_limit_watts) {
+        (Some(draw), Some(limit)) => format!("{draw:.2}/{limit:.2} W"),
+        (Some(draw), None) => format!("{draw:.2} W"),
+        (None, _) => "N/A W".to_owned(),
+    };
+    let memory = match (telemetry.memory_used_mib, telemetry.memory_total_mib) {
+        (Some(used), Some(total)) => format!("{used:.0}/{total:.0} MiB"),
+        _ => "N/A".to_owned(),
+    };
+    format!(
+        "{power} | {} | temp {} | fan {} | util {} | core {} | mem {} | VRAM {memory}",
+        format_metric(efficiency, "H/W"),
+        format_metric(telemetry.temperature_celsius, "C"),
+        format_metric(telemetry.fan_percent, "%"),
+        format_metric(telemetry.utilization_percent, "%"),
+        format_metric(telemetry.graphics_clock_mhz, "MHz"),
+        format_metric(telemetry.memory_clock_mhz, "MHz"),
+    )
+}
+
+fn format_metric(value: Option<f64>, unit: &str) -> String {
+    value.map_or_else(|| "N/A".to_owned(), |value| format!("{value:.2} {unit}"))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 fn run_miner(options: MinerOptions) -> Result<()> {
     if options.batch_size == 0 || options.batch_size > MAX_BATCH_SIZE {
         bail!("--batch-size must be between 1 and {MAX_BATCH_SIZE}");
@@ -264,6 +429,7 @@ fn run_miner(options: MinerOptions) -> Result<()> {
     for device in &devices {
         println!("  GPU {}: {}", device.index, device.label());
     }
+    println!("Hashrate unit: 1 H/s = 1 complete ForgeMatrix nonce evaluation per second.");
     println!("Press Ctrl+C to stop.\n");
 
     if !synchronize_before_mining(Arc::clone(&shared), &peer_config, &shutdown)? {
@@ -393,7 +559,7 @@ fn continuous_mining(
     config: ContinuousMiningConfig,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut blocks_found = 0_u64;
+    let mut statistics = SessionStatistics::new(&devices);
     while !shutdown.load(Ordering::Acquire) {
         let job = {
             let node = node.lock().map_err(|_| anyhow!("node mutex is poisoned"))?;
@@ -409,12 +575,18 @@ fn continuous_mining(
             cuda.clone(),
             devices.clone(),
             job,
-            config.batch_size,
-            config.stats_interval,
+            JobMiningConfig {
+                batch_size: config.batch_size,
+                stats_interval: config.stats_interval,
+            },
             Arc::clone(&shutdown),
+            &mut statistics,
         )? {
             JobOutcome::Shutdown => break,
-            JobOutcome::Stale => println!("New chain tip received; rebuilding work."),
+            JobOutcome::Stale => {
+                statistics.stale_jobs = statistics.stale_jobs.saturating_add(1);
+                println!("New chain tip received; rebuilding work.");
+            }
             JobOutcome::Found { device, block } => {
                 let block_id = block.block_id();
                 let height = block.challenge.height;
@@ -429,7 +601,7 @@ fn continuous_mining(
                     }
                 };
                 if accepted {
-                    blocks_found = blocks_found.saturating_add(1);
+                    statistics.blocks_found = statistics.blocks_found.saturating_add(1);
                     let relayed = config
                         .peers
                         .peers
@@ -456,13 +628,15 @@ fn continuous_mining(
                         };
                         println!(
                             "BLOCK FOUND | GPU {device} | height {height} | {} | {relay} | session blocks {blocks_found}",
-                            hex::encode(block_id)
+                            hex::encode(block_id),
+                            blocks_found = statistics.blocks_found
                         );
                     } else {
                         println!(
                             "BLOCK FOUND LOCALLY | GPU {device} | height {height} | {} | node sync pending {relayed}/{} (automatic retry) | session blocks {blocks_found}",
                             hex::encode(block_id),
-                            config.peers.peers.len()
+                            config.peers.peers.len(),
+                            blocks_found = statistics.blocks_found
                         );
                     }
                 } else {
@@ -480,9 +654,9 @@ fn mine_job(
     cuda: CudaLibrary,
     devices: Vec<CudaDevice>,
     job: MiningJob,
-    batch_size: u32,
-    stats_interval: Duration,
+    config: JobMiningConfig,
     shutdown: Arc<AtomicBool>,
+    statistics: &mut SessionStatistics,
 ) -> Result<JobOutcome> {
     let worker_cancel = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::sync_channel(devices.len().saturating_mul(4).max(4));
@@ -497,7 +671,7 @@ fn mine_job(
                     ordinal,
                     worker_count: devices.len(),
                     job: job.clone(),
-                    batch_size,
+                    batch_size: config.batch_size,
                 },
                 Arc::clone(&worker_cancel),
                 sender.clone(),
@@ -515,9 +689,12 @@ fn mine_job(
         &devices,
         &job,
         &receiver,
-        stats_interval,
-        shutdown,
-        worker_cancel,
+        MonitorControl {
+            stats_interval: config.stats_interval,
+            shutdown,
+            worker_cancel,
+        },
+        statistics,
     );
     workers.stop()?;
     outcome
@@ -625,19 +802,15 @@ fn monitor_workers(
     devices: &[CudaDevice],
     job: &MiningJob,
     receiver: &Receiver<WorkerMessage>,
-    stats_interval: Duration,
-    shutdown: Arc<AtomicBool>,
-    worker_cancel: Arc<AtomicBool>,
+    control: MonitorControl,
+    statistics: &mut SessionStatistics,
 ) -> Result<JobOutcome> {
     let mut ready = BTreeSet::new();
-    let mut totals: BTreeMap<i32, u64> = devices.iter().map(|device| (device.index, 0)).collect();
-    let mut last_totals = totals.clone();
-    let mut last_report = Instant::now();
     let expected_parent = hex::encode(job.challenge().previous_block);
 
     loop {
-        if shutdown.load(Ordering::Acquire) {
-            worker_cancel.store(true, Ordering::Release);
+        if control.shutdown.load(Ordering::Acquire) {
+            control.worker_cancel.store(true, Ordering::Release);
             return Ok(JobOutcome::Shutdown);
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -650,27 +823,19 @@ fn monitor_workers(
                 );
             }
             Ok(WorkerMessage::Progress { device, attempts }) => {
-                *totals.entry(device).or_default() = totals
-                    .get(&device)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(attempts);
+                statistics.record_attempts(device, attempts);
             }
             Ok(WorkerMessage::Found {
                 device,
                 block,
                 attempts,
             }) => {
-                *totals.entry(device).or_default() = totals
-                    .get(&device)
-                    .copied()
-                    .unwrap_or_default()
-                    .saturating_add(attempts);
-                worker_cancel.store(true, Ordering::Release);
+                statistics.record_attempts(device, attempts);
+                control.worker_cancel.store(true, Ordering::Release);
                 return Ok(JobOutcome::Found { device, block });
             }
             Ok(WorkerMessage::Failed { device, error }) => {
-                worker_cancel.store(true, Ordering::Release);
+                control.worker_cancel.store(true, Ordering::Release);
                 bail!("GPU {device} failed: {error}");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -679,26 +844,7 @@ fn monitor_workers(
             }
         }
 
-        if last_report.elapsed() >= stats_interval {
-            let elapsed = last_report.elapsed().as_secs_f64().max(f64::EPSILON);
-            let mut total_rate = 0.0;
-            let mut details = Vec::with_capacity(devices.len());
-            for device in devices {
-                let total = totals.get(&device.index).copied().unwrap_or_default();
-                let previous = last_totals.get(&device.index).copied().unwrap_or_default();
-                let rate = total.saturating_sub(previous) as f64 / elapsed;
-                total_rate += rate;
-                details.push(format!("GPU {}: {:.2} eval/s", device.index, rate));
-                last_totals.insert(device.index, total);
-            }
-            println!(
-                "Rig: {:.2} eval/s | {} | total attempts {}",
-                total_rate,
-                details.join(" | "),
-                totals.values().copied().sum::<u64>()
-            );
-            last_report = Instant::now();
-        }
+        statistics.report_if_due(devices, job.challenge().height, control.stats_interval);
 
         let current_tip = node
             .lock()
@@ -706,7 +852,7 @@ fn monitor_workers(
             .status()?
             .tip;
         if current_tip != expected_parent {
-            worker_cancel.store(true, Ordering::Release);
+            control.worker_cancel.store(true, Ordering::Release);
             return Ok(JobOutcome::Stale);
         }
     }
@@ -820,6 +966,40 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_format_reports_power_efficiency_and_sensors() {
+        let telemetry = GpuTelemetry {
+            power_watts: Some(250.0),
+            power_limit_watts: Some(300.0),
+            temperature_celsius: Some(64.0),
+            fan_percent: Some(52.0),
+            utilization_percent: Some(99.0),
+            graphics_clock_mhz: Some(2_745.0),
+            memory_clock_mhz: Some(10_501.0),
+            memory_used_mib: Some(2_048.0),
+            memory_total_mib: Some(24_564.0),
+        };
+
+        let rendered = format_gpu_telemetry(1_000.0, Some(&telemetry));
+        assert!(rendered.contains("250.00/300.00 W"));
+        assert!(rendered.contains("4.00 H/W"));
+        assert!(rendered.contains("temp 64.00 C"));
+        assert!(rendered.contains("fan 52.00 %"));
+        assert!(rendered.contains("util 99.00 %"));
+        assert!(rendered.contains("core 2745.00 MHz"));
+        assert!(rendered.contains("mem 10501.00 MHz"));
+        assert!(rendered.contains("VRAM 2048/24564 MiB"));
+        assert_eq!(
+            format_gpu_telemetry(1_000.0, None),
+            "power N/A | efficiency N/A | sensors N/A"
+        );
+    }
+
+    #[test]
+    fn duration_format_does_not_wrap_after_one_day() {
+        assert_eq!(format_duration(Duration::from_secs(93_784)), "26:03:04");
+    }
+
+    #[test]
     fn packaged_launchers_try_local_wallet_before_bootstrap() {
         let windows = include_str!("../../../packaging/standalone-miner/windows/START-MINER.bat");
         let linux = include_str!("../../../packaging/standalone-miner/linux/start-miner.sh");
@@ -830,6 +1010,7 @@ mod tests {
             assert!(local < bootstrap);
             assert_eq!(launcher.matches("--peer").count(), 2);
             assert!(launcher.contains("--allow-public-peers"));
+            assert!(launcher.contains("--stats-seconds"));
         }
         assert!(windows.contains("%LOCALAPPDATA%\\Common Foundry Miner\\devnet-0"));
         assert!(

@@ -25,6 +25,13 @@ Supported native CUDA targets:
 The miner keeps one CUDA context and one worker on each selected GPU. Work
 ranges are separated so GPUs in the same rig do not repeat one another.
 
+Every five seconds the miner prints rig and per-GPU hashrate, power draw,
+hashes per watt, temperature, fan, utilization, clocks, VRAM use, uptime,
+attempts, accepted blocks, and stale jobs. One H/s means one complete
+ForgeMatrix nonce evaluation per second. Sensors that a card does not expose
+show N/A and do not interrupt mining. Edit STATS_SECONDS in start-miner.sh to
+change the reporting interval.
+
 The miner first tries the local wallet at 127.0.0.1:18444, then the community
 bootstrap. A status such as "node sync 1/2" means one peer is connected and is
 working normally. Temporary relay failures retry automatically.

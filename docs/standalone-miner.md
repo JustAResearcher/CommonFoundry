@@ -32,6 +32,16 @@ to install the CUDA Toolkit.
   size`. This keeps nonce ranges disjoint across the rig.
 - The displayed rig rate is the sum of complete ForgeMatrix nonce evaluations
   from every worker.
+- Every statistics report includes rig and per-GPU hashrate, NVIDIA-reported
+  power draw, hashes per watt, temperature, fan, utilization, graphics and
+  memory clocks, and VRAM use. Session uptime, attempted nonces, accepted
+  blocks, and stale-job rebuilds are also shown.
+- One displayed `H/s` is one complete ForgeMatrix nonce evaluation per second.
+  It is not an INT8 operation count.
+- NVIDIA sensors are read through `nvidia-smi`, which ships with the driver.
+  Unsupported sensors display `N/A`; telemetry failure never stops mining.
+  Hashes per watt divides the interval hashrate by the instantaneous power
+  sample taken for that report.
 - CUDA is a candidate generator. Rust independently recomputes a below-target
   candidate before it can be submitted as a block.
 
@@ -69,6 +79,12 @@ Select GPUs 0, 1, and 3:
 
 ```text
 cmfd-miner mine --device 0 --device 1 --device 3
+```
+
+Change the live-statistics interval from its five-second default:
+
+```text
+cmfd-miner mine --stats-seconds 10
 ```
 
 The standalone miner currently performs continuous solo mining. Its embedded

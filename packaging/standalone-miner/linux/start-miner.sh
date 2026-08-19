@@ -11,9 +11,10 @@ GPU_INDEXES=""
 # PAYOUT_ADDRESS is your wallet's 64-character receive address.
 PAYOUT_ADDRESS=""
 BATCH_SIZE="8192"
+STATS_SECONDS="5"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
-ARGS=(mine --data-dir "$DATA_DIR" --p2p-bind "$P2P_BIND" --batch-size "$BATCH_SIZE")
+ARGS=(mine --data-dir "$DATA_DIR" --p2p-bind "$P2P_BIND" --batch-size "$BATCH_SIZE" --stats-seconds "$STATS_SECONDS")
 if [[ -n "$LOCAL_PEER" ]]; then
   ARGS+=(--peer "$LOCAL_PEER")
 fi

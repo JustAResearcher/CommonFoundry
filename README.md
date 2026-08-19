@@ -76,7 +76,8 @@ See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
 boundary, supported architectures, wallet packaging, and tester procedure.
 Dedicated rigs can use the [standalone multi-GPU miner](docs/standalone-miner.md),
 whose Windows ZIP includes editable `START-MINER.bat` and `LIST-GPUS.bat`
-launchers.
+launchers. Its live console reports per-GPU and rig hashrate, power, hashes per
+watt, temperature, fan, utilization, clocks, VRAM use, uptime, and work counts.
 
 `profile16gb` reports the disabled, seed-based v1 candidate; it is not the v2
 profile. The v2 CLI/test paths are deliberately capped to tiny research shapes

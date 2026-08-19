@@ -14,6 +14,7 @@ set "GPU_INDEXES="
 rem PAYOUT_ADDRESS is your wallet's 64-character receive address.
 set "PAYOUT_ADDRESS="
 set "BATCH_SIZE=8192"
+set "STATS_SECONDS=5"
 rem ================================================================
 rem GPU_INDEXES examples:
 rem   blank   = use every supported NVIDIA GPU
@@ -58,7 +59,8 @@ echo.
   !PEER_ARGS! ^
   !DEVICE_ARGS! ^
   !PAYOUT_ARGS! ^
-  --batch-size %BATCH_SIZE%
+  --batch-size %BATCH_SIZE% ^
+  --stats-seconds %STATS_SECONDS%
 
 echo.
 echo Miner stopped with exit code %ERRORLEVEL%.
