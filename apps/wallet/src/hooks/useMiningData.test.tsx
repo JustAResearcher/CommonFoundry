@@ -17,6 +17,8 @@ const stoppedStatus: MiningStatus = {
   payout: null,
   pool_url: null,
   worker_name: null,
+  engine: "cpu",
+  device: null,
   matrix_attempts_per_second: 0,
   session_attempts: 0,
   blocks_found: 0,

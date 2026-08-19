@@ -20,6 +20,8 @@ const stoppedStatus: MiningStatus = {
   payout: null,
   pool_url: null,
   worker_name: null,
+  engine: "cpu",
+  device: null,
   matrix_attempts_per_second: 0,
   session_attempts: 0,
   blocks_found: 0,
@@ -36,6 +38,8 @@ const runningStatus: MiningStatus = {
   lifecycle: "running",
   mode: "solo",
   payout,
+  engine: "cuda",
+  device: "NVIDIA GeForce RTX 4090 (CUDA 8.9)",
   matrix_attempts_per_second: 42.25,
   session_attempts: 2_500,
   blocks_found: 1,
@@ -50,6 +54,8 @@ const runningPoolStatus: MiningStatus = {
   payout,
   pool_url: poolUrl,
   worker_name: "foundry.worker-1",
+  engine: "cuda",
+  device: "NVIDIA GeForce RTX 4090 (CUDA 8.9)",
   matrix_attempts_per_second: 19.375,
   session_attempts: 4_321,
   blocks_found: 2,
@@ -80,6 +86,9 @@ describe("MiningView", () => {
     expect(apiMocks.startMining).toHaveBeenCalledWith({ mode: "solo", payout });
     expect(await screen.findByRole("button", { name: "Stop Mining" })).toBeEnabled();
     expect(screen.getByText("42.25")).toBeInTheDocument();
+    expect(screen.getByText("CUDA INT8 matrix engine")).toBeInTheDocument();
+    expect(screen.getAllByText("NVIDIA GeForce RTX 4090 (CUDA 8.9)").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Rust recomputes every candidate before submission/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Stop Mining" }));
     await waitFor(() => expect(apiMocks.stopMining).toHaveBeenCalledTimes(1));

@@ -1,6 +1,6 @@
 # Private Devnet-0
 
-Devnet-0 is a private multi-node consensus, fork-choice, persistence, mempool,
+Devnet-0 is a bounded multi-node consensus, fork-choice, persistence, mempool,
 and synchronization harness. It is not a public testnet and must not carry
 value. RPC is restricted to loopback addresses. P2P listeners and explicitly
 configured static peers may use loopback or private IP addresses.
@@ -111,10 +111,12 @@ CORS headers.
 The GUI uses the node's active chain and mempool rather than sample data. It
 shows balances and transaction history, displays and copies the receive
 destination, signs and submits sends, and can run a continuous, cancellable
-solo miner against the tiny CPU reference profile. Its reported rate is exact
-ForgeMatrix matrix evaluations per second. It is not an optimized GPU rate,
-and the software does not prove physical GPU or VRAM use. Transaction fees are
-burned. Mined rewards remain immature for 100 confirmations and cannot be
+Solo or Pool miner against the tiny reference profile. An optional CUDA backend
+accelerates its exact INT8 matrix stage on one supported NVIDIA GPU; Rust
+recomputes every below-target candidate before it is submitted or credited. Its
+reported rate is complete ForgeMatrix nonce evaluations per second, not raw GPU
+TOPS, and the software does not prove physical GPU or VRAM use. See
+[ForgeMatrix v2 CUDA miner](cuda-miner.md). Transaction fees are burned. Mined rewards remain immature for 100 confirmations and cannot be
 spent or consolidated before then.
 
 The Pool mode connects to the CMFD Devnet pool v1 protocol. Enter a URL in the
@@ -140,9 +142,11 @@ not become stranded. Neither mode provides encryption, mnemonic recovery,
 hardware-wallet integration, or production custody; never send either real
 value.
 
-The packaged wallet can also connect its embedded node to static private P2P
-peers. See [../apps/wallet/src-tauri/README.md](../apps/wallet/src-tauri/README.md)
-for the exact Windows and Linux command-line options.
+The packaged wallet can also connect its embedded node to static P2P peers.
+Private addresses work by default; numeric public peers require the explicit
+`--allow-public-peers` test-only option. See
+[../apps/wallet/src-tauri/README.md](../apps/wallet/src-tauri/README.md) for the
+exact Windows and Linux command-line options.
 
 ## Run a local pool
 
@@ -282,7 +286,9 @@ Set-Location C:\Source\CommonFoundry
 Peers that are not running yet do not prevent startup; the static poller tries
 again every two seconds. For a two-node network, omit Terminal C and its
 `--peer 127.0.0.1:18464` option from A and B. `--peer` is repeatable, and the
-listener rejects public addresses, duplicate peers, and its own address.
+listener rejects public addresses unless `--allow-public-peers` is present. It
+always rejects unsafe/unspecified addresses, duplicate peers, and its own
+address.
 
 Each two-second peer poll performs the compatibility handshake, pulls at most
 16 blocks first, then requests the remote mempool inventory and at most 64
@@ -290,6 +296,45 @@ unknown transaction bodies. Every returned body must match its advertised ID
 and pass the node's normal consensus and mempool admission rules. Relay is
 pull-only: there is no unsolicited push broadcast, so each destination must be
 configured to poll a source directly or through another polling node.
+
+## Run a small direct-IP test network
+
+This is the simplest Windows-hub/Linux-tester layout. It is opt-in because P2P
+is unauthenticated and unencrypted.
+
+1. On the Windows router, forward **TCP 18444 only** to the Windows computer's
+   private LAN address. Do not forward RPC port 18443.
+2. Allow inbound TCP 18444 through Windows Firewall on the intended profile.
+3. Start the Windows wallet from PowerShell, replacing the executable path and
+   LAN address:
+
+```powershell
+& 'C:\path\to\common-foundry-wallet.exe' `
+  --p2p-bind 192.168.1.50:18444 `
+  --allow-public-peers
+```
+
+4. Give each Linux tester the Windows router's public IP. They start the
+   AppImage with:
+
+```bash
+chmod +x Common-Foundry-Wallet.AppImage
+./Common-Foundry-Wallet.AppImage \
+  --allow-public-peers \
+  --peer PUBLIC_IP:18444
+```
+
+The Windows wallet can now Solo mine and the Linux wallets will pull its blocks
+on their regular peer poll. Compare block height, tip, and cumulative work on
+the Network page. Testers do not need to forward a port merely to follow the
+hub. Because propagation is pull-only, a tester who wants independently mined
+blocks to flow back must also expose a reachable P2P listener and be configured
+as a reciprocal peer.
+
+`--allow-public-peers` does not add peer identity, encryption, discovery,
+automatic bans, reputation, or demonstrated DDoS resistance. Stop the public
+listener after the bounded test, never expose RPC, and never use this mode with
+valuable funds.
 
 ## Loopback RPC
 

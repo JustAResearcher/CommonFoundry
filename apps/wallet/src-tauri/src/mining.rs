@@ -5,8 +5,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cmfd_node::pool::{PoolClient, PoolClientConfig, PoolError, PoolWorkSearchResult};
-use cmfd_node::{MiningSearchResult, Node, NodeClientError, NodeError, parse_miner_destination};
+use cmfd_node::{
+    MiningSearchResult, MiningShareSearchResult, Node, NodeClientError, NodeError,
+    parse_miner_destination,
+};
 use serde::{Deserialize, Serialize};
+
+use crate::cuda::CudaMiner;
 
 const SEARCH_BATCH_ATTEMPTS: u64 = 4_096;
 const POOL_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
@@ -30,6 +35,13 @@ pub enum MiningLifecycle {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MiningEngine {
+    Cpu,
+    Cuda,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MiningStartRequest {
     pub mode: MiningMode,
@@ -51,6 +63,8 @@ pub struct MiningStatus {
     pub payout: Option<String>,
     pub pool_url: Option<String>,
     pub worker_name: Option<String>,
+    pub engine: MiningEngine,
+    pub device: Option<String>,
     pub matrix_attempts_per_second: f64,
     pub session_attempts: u64,
     pub blocks_found: u64,
@@ -94,6 +108,8 @@ impl MiningManager {
                 payout: None,
                 pool_url: None,
                 worker_name: None,
+                engine: MiningEngine::Cpu,
+                device: None,
                 matrix_attempts_per_second: 0.0,
                 session_attempts: 0,
                 blocks_found: 0,
@@ -214,6 +230,8 @@ impl MiningManager {
                 payout: Some(request.payout.clone()),
                 pool_url: request.pool_url.clone(),
                 worker_name: request.worker_name.clone(),
+                engine: MiningEngine::Cpu,
+                device: None,
                 matrix_attempts_per_second: 0.0,
                 session_attempts: 0,
                 blocks_found: 0,
@@ -332,6 +350,8 @@ fn mining_loop(
     payout: [u8; 32],
 ) {
     let mut next_nonce = 0_u64;
+    let mut cuda = None;
+    let mut cuda_initialized = false;
 
     'jobs: while !stop.load(Ordering::Acquire) {
         let job = match node
@@ -350,12 +370,30 @@ fn mining_loop(
             current.current_height = job.challenge().height.saturating_sub(1);
             current.last_error = None;
         }
+        if !cuda_initialized {
+            cuda = initialize_solo_cuda(&job, &status);
+            cuda_initialized = true;
+        }
 
         loop {
             let started = Instant::now();
-            let result = match job.search_range(next_nonce, SEARCH_BATCH_ATTEMPTS, || {
-                stop.load(Ordering::Acquire)
-            }) {
+            let accelerated = cuda
+                .as_mut()
+                .map(|backend| search_solo_cuda(&job, backend, next_nonce, &stop));
+            let result = match accelerated {
+                Some(Ok(result)) => Ok(result),
+                Some(Err(error)) => {
+                    cuda = None;
+                    mark_cuda_fallback(&status, &error);
+                    job.search_range(next_nonce, SEARCH_BATCH_ATTEMPTS, || {
+                        stop.load(Ordering::Acquire)
+                    })
+                }
+                None => job.search_range(next_nonce, SEARCH_BATCH_ATTEMPTS, || {
+                    stop.load(Ordering::Acquire)
+                }),
+            };
+            let result = match result {
                 Ok(result) => result,
                 Err(error) => {
                     fail_worker(&status, error.client_error().message);
@@ -452,6 +490,113 @@ fn mining_loop(
     }
 }
 
+fn initialize_solo_cuda(
+    job: &cmfd_node::MiningJob,
+    status: &Mutex<MiningStatus>,
+) -> Option<CudaMiner> {
+    let model = match job.accelerator_model() {
+        Ok(model) => model,
+        Err(error) => {
+            mark_cuda_fallback(status, &error.client_error().message);
+            return None;
+        }
+    };
+    let mut backend = match CudaMiner::load(&model) {
+        Ok(Some(backend)) => backend,
+        Ok(None) => return None,
+        Err(error) => {
+            mark_cuda_fallback(status, &error);
+            return None;
+        }
+    };
+    let validation = job
+        .prepare_accelerator_batch(0, 1)
+        .map_err(|error| error.client_error().message)
+        .and_then(|batch| {
+            let outputs = backend.evaluate(&batch)?;
+            job.verify_accelerator_output(&batch, 0, &outputs)
+                .map_err(|error| error.client_error().message)?;
+            Ok(())
+        });
+    if let Err(error) = validation {
+        mark_cuda_fallback(status, &format!("CUDA differential check failed: {error}"));
+        return None;
+    }
+    mark_cuda_active(status, backend.device().label());
+    Some(backend)
+}
+
+fn search_solo_cuda(
+    job: &cmfd_node::MiningJob,
+    backend: &mut CudaMiner,
+    start_nonce: u64,
+    stop: &AtomicBool,
+) -> Result<MiningSearchResult, String> {
+    if stop.load(Ordering::Acquire) {
+        return Ok(MiningSearchResult::Cancelled {
+            attempts_completed: 0,
+            next_nonce: start_nonce,
+        });
+    }
+    let batch = job
+        .prepare_accelerator_batch(start_nonce, SEARCH_BATCH_ATTEMPTS as u32)
+        .map_err(|error| error.client_error().message)?;
+    let outputs = backend.evaluate(&batch)?;
+    let result = job
+        .complete_accelerator_batch(&batch, &outputs, job.challenge().target)
+        .map_err(|error| error.client_error().message)?;
+    match result {
+        MiningShareSearchResult::Found {
+            proof,
+            attempts_completed,
+            next_nonce,
+            ..
+        } => {
+            let block = job
+                .build_block_if_chain_valid(&proof)
+                .map_err(|error| error.client_error().message)?
+                .ok_or_else(|| {
+                    "CUDA candidate did not meet the immutable chain target".to_owned()
+                })?;
+            Ok(MiningSearchResult::Found {
+                block,
+                attempts_completed,
+                next_nonce,
+            })
+        }
+        MiningShareSearchResult::Exhausted {
+            attempts_completed,
+            next_nonce,
+        } => Ok(MiningSearchResult::Exhausted {
+            attempts_completed,
+            next_nonce,
+        }),
+        MiningShareSearchResult::Cancelled {
+            attempts_completed,
+            next_nonce,
+        } => Ok(MiningSearchResult::Cancelled {
+            attempts_completed,
+            next_nonce,
+        }),
+    }
+}
+
+fn mark_cuda_active(status: &Mutex<MiningStatus>, device: String) {
+    if let Ok(mut current) = status.lock() {
+        current.engine = MiningEngine::Cuda;
+        current.device = Some(device);
+        current.last_error = None;
+    }
+}
+
+fn mark_cuda_fallback(status: &Mutex<MiningStatus>, error: &str) {
+    if let Ok(mut current) = status.lock() {
+        current.engine = MiningEngine::Cpu;
+        current.device = None;
+        current.last_error = Some(format!("CUDA unavailable; CPU fallback active. {error}"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PoolEndpoint {
     address: SocketAddr,
@@ -471,6 +616,8 @@ fn pool_mining_loop(
 ) {
     let mut reconnect_delay = POOL_RECONNECT_INITIAL;
     let mut credited_atoms = 0_u64;
+    let mut cuda = None;
+    let mut cuda_initialized = false;
 
     while !stop.load(Ordering::Acquire) {
         let mut client = match PoolClient::connect(config.clone()) {
@@ -505,7 +652,14 @@ fn pool_mining_loop(
             current.last_error = None;
         }
 
-        match mine_pool_connection(&mut client, &status, &stop, &mut credited_atoms) {
+        match mine_pool_connection(
+            &mut client,
+            &status,
+            &stop,
+            &mut credited_atoms,
+            &mut cuda,
+            &mut cuda_initialized,
+        ) {
             Ok(()) => break,
             Err(error) if pool_error_is_reconnectable(&error) => {
                 if stop.load(Ordering::Acquire) {
@@ -539,6 +693,8 @@ fn mine_pool_connection(
     status: &Mutex<MiningStatus>,
     stop: &AtomicBool,
     credited_atoms: &mut u64,
+    cuda: &mut Option<CudaMiner>,
+    cuda_initialized: &mut bool,
 ) -> Result<(), PoolError> {
     let mut remote_credited_atoms = 0_u64;
     let mut cursor = PoolNonceCursor::default();
@@ -546,6 +702,10 @@ fn mine_pool_connection(
     while !stop.load(Ordering::Acquire) {
         let work = client.current_work()?;
         let job = work.job();
+        if !*cuda_initialized {
+            *cuda = initialize_pool_cuda(&work, status);
+            *cuda_initialized = true;
+        }
         if cursor.job_id != Some(job.job_id) {
             cursor.job_id = Some(job.job_id);
             cursor.next_nonce = client.current_nonce_origin();
@@ -555,9 +715,22 @@ fn mine_pool_connection(
         }
 
         let started = Instant::now();
-        let result = work.search_range(cursor.next_nonce, SEARCH_BATCH_ATTEMPTS, || {
-            stop.load(Ordering::Acquire)
-        })?;
+        let accelerated = cuda
+            .as_mut()
+            .map(|backend| search_pool_cuda(&work, backend, cursor.next_nonce, stop));
+        let result = match accelerated {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => {
+                *cuda = None;
+                mark_cuda_fallback(status, &error);
+                work.search_range(cursor.next_nonce, SEARCH_BATCH_ATTEMPTS, || {
+                    stop.load(Ordering::Acquire)
+                })?
+            }
+            None => work.search_range(cursor.next_nonce, SEARCH_BATCH_ATTEMPTS, || {
+                stop.load(Ordering::Acquire)
+            })?,
+        };
         let elapsed = started.elapsed().as_secs_f64();
         let (attempts_completed, next_nonce) = match &result {
             PoolWorkSearchResult::Found {
@@ -615,6 +788,62 @@ fn mine_pool_connection(
         }
     }
     Ok(())
+}
+
+fn initialize_pool_cuda(
+    work: &cmfd_node::pool::PoolMiningWork,
+    status: &Mutex<MiningStatus>,
+) -> Option<CudaMiner> {
+    let model = match work.accelerator_model() {
+        Ok(model) => model,
+        Err(error) => {
+            mark_cuda_fallback(status, &error.to_string());
+            return None;
+        }
+    };
+    let mut backend = match CudaMiner::load(&model) {
+        Ok(Some(backend)) => backend,
+        Ok(None) => return None,
+        Err(error) => {
+            mark_cuda_fallback(status, &error);
+            return None;
+        }
+    };
+    let validation = work
+        .prepare_accelerator_batch(0, 1)
+        .map_err(|error| error.to_string())
+        .and_then(|batch| {
+            let outputs = backend.evaluate(&batch)?;
+            work.verify_accelerator_output(&batch, 0, &outputs)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        });
+    if let Err(error) = validation {
+        mark_cuda_fallback(status, &format!("CUDA differential check failed: {error}"));
+        return None;
+    }
+    mark_cuda_active(status, backend.device().label());
+    Some(backend)
+}
+
+fn search_pool_cuda(
+    work: &cmfd_node::pool::PoolMiningWork,
+    backend: &mut CudaMiner,
+    start_nonce: u64,
+    stop: &AtomicBool,
+) -> Result<PoolWorkSearchResult, String> {
+    if stop.load(Ordering::Acquire) {
+        return Ok(PoolWorkSearchResult::Cancelled {
+            attempts_completed: 0,
+            next_nonce: start_nonce,
+        });
+    }
+    let batch = work
+        .prepare_accelerator_batch(start_nonce, SEARCH_BATCH_ATTEMPTS as u32)
+        .map_err(|error| error.to_string())?;
+    let outputs = backend.evaluate(&batch)?;
+    work.complete_accelerator_batch(&batch, &outputs)
+        .map_err(|error| error.to_string())
 }
 
 fn interruptible_backoff(stop: &AtomicBool, duration: Duration) -> bool {

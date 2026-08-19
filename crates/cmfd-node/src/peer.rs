@@ -137,17 +137,24 @@ impl PeerLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAddressPolicy {
+    PrivateOnly,
+    AllowPublic,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticPeerConfig {
     pub listen_address: SocketAddr,
     pub peers: Vec<SocketAddr>,
     pub limits: PeerLimits,
+    pub address_policy: PeerAddressPolicy,
 }
 
 impl StaticPeerConfig {
     pub fn validate(&self) -> Result<(), PeerError> {
         self.limits.validate()?;
-        validate_private_address(self.listen_address)?;
+        validate_peer_address(self.listen_address, self.address_policy)?;
         if self.peers.len() > self.limits.max_peers {
             return Err(PeerError::TooManyPeers {
                 actual: self.peers.len(),
@@ -156,7 +163,7 @@ impl StaticPeerConfig {
         }
         let mut unique = HashSet::with_capacity(self.peers.len());
         for peer in &self.peers {
-            validate_private_address(*peer)?;
+            validate_peer_address(*peer, self.address_policy)?;
             if *peer == self.listen_address {
                 return Err(PeerError::ConfiguredSelfAddress(*peer));
             }
@@ -218,8 +225,12 @@ pub enum PeerError {
     PeerBudgetExceeded,
     #[error("peer limits are zero, unusable for a mutual hello, or exceed hard protocol bounds")]
     InvalidLimits,
-    #[error("peer address must use a nonzero port on loopback or a private IP: {0}")]
+    #[error(
+        "peer address must use a nonzero port on loopback or a private IP unless public peers were explicitly enabled: {0}"
+    )]
     NonPrivateAddress(SocketAddr),
+    #[error("peer address is unspecified, multicast, broadcast, or otherwise unsafe: {0}")]
+    UnsafeAddress(SocketAddr),
     #[error("configured peer count {actual} exceeds limit {max}")]
     TooManyPeers { actual: usize, max: usize },
     #[error("configured peer duplicates the local listener: {0}")]
@@ -252,12 +263,20 @@ pub fn process_node_nonce() -> [u8; 32] {
     })
 }
 
-fn validate_private_address(address: SocketAddr) -> Result<(), PeerError> {
-    let allowed = match address.ip() {
+fn validate_peer_address(address: SocketAddr, policy: PeerAddressPolicy) -> Result<(), PeerError> {
+    let private = match address.ip() {
         IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
     };
-    if address.port() == 0 || !allowed {
+    let unsafe_address = address.port() == 0
+        || match address.ip() {
+            IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast() || ip.octets() == [255; 4],
+            IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast(),
+        };
+    if unsafe_address {
+        return Err(PeerError::UnsafeAddress(address));
+    }
+    if !private && policy == PeerAddressPolicy::PrivateOnly {
         return Err(PeerError::NonPrivateAddress(address));
     }
     Ok(())
@@ -820,15 +839,31 @@ pub struct PeerConnection {
 
 impl PeerConnection {
     pub fn connect(address: SocketAddr, session: PeerSession) -> Result<Self, PeerError> {
-        validate_private_address(address)?;
+        Self::connect_with_policy(address, session, PeerAddressPolicy::PrivateOnly)
+    }
+
+    pub fn connect_with_policy(
+        address: SocketAddr,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+    ) -> Result<Self, PeerError> {
+        validate_peer_address(address, address_policy)?;
         let limits = session.limits();
         let stream =
             TcpStream::connect_timeout(&address, limits.connect_timeout).map_err(PeerError::Io)?;
-        Self::from_stream(stream, session)
+        Self::from_stream_with_policy(stream, session, address_policy)
     }
 
     pub fn from_stream(stream: TcpStream, session: PeerSession) -> Result<Self, PeerError> {
-        validate_private_address(stream.peer_addr().map_err(PeerError::Io)?)?;
+        Self::from_stream_with_policy(stream, session, PeerAddressPolicy::PrivateOnly)
+    }
+
+    pub fn from_stream_with_policy(
+        stream: TcpStream,
+        session: PeerSession,
+        address_policy: PeerAddressPolicy,
+    ) -> Result<Self, PeerError> {
+        validate_peer_address(stream.peer_addr().map_err(PeerError::Io)?, address_policy)?;
         let limits = session.limits();
         limits.validate()?;
         stream.set_nodelay(true).map_err(PeerError::Io)?;
@@ -1489,7 +1524,7 @@ mod tests {
     }
 
     #[test]
-    fn static_peer_configuration_allows_only_private_unique_bounded_addresses() {
+    fn static_peer_configuration_requires_explicit_public_opt_in() {
         let valid = StaticPeerConfig {
             listen_address: "127.0.0.1:19000".parse().unwrap(),
             peers: vec![
@@ -1497,6 +1532,7 @@ mod tests {
                 "192.168.1.20:19000".parse().unwrap(),
             ],
             limits: PeerLimits::default(),
+            address_policy: PeerAddressPolicy::PrivateOnly,
         };
         valid.validate().unwrap();
 
@@ -1505,6 +1541,13 @@ mod tests {
         assert!(matches!(
             public.validate(),
             Err(PeerError::NonPrivateAddress(_))
+        ));
+        public.address_policy = PeerAddressPolicy::AllowPublic;
+        public.validate().unwrap();
+        public.listen_address = "0.0.0.0:19000".parse().unwrap();
+        assert!(matches!(
+            public.validate(),
+            Err(PeerError::UnsafeAddress(_))
         ));
         let mut duplicate = valid.clone();
         duplicate.peers = vec![

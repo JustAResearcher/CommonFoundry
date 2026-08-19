@@ -1,8 +1,9 @@
-//! Minimal bounded private-network peer runtime for Devnet-0.
+//! Minimal bounded peer runtime for Devnet-0.
 //!
 //! The transport handshake binds network and consensus parameters, but it does
 //! not authenticate peer identity or encrypt traffic. This module therefore
-//! only accepts loopback and private-address peers, as enforced by `peer`.
+//! defaults to loopback/private addresses; public peers require an explicit
+//! unsafe Devnet opt-in enforced by `peer`.
 
 use std::collections::HashSet;
 use std::io;
@@ -16,7 +17,8 @@ use cmfd_consensus::{Block, Transaction, WireError, decode_block};
 use thiserror::Error;
 
 use crate::peer::{
-    PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession, StaticPeerConfig,
+    PeerAddressPolicy, PeerConnection, PeerError, PeerHello, PeerLimits, PeerMessage, PeerSession,
+    StaticPeerConfig,
 };
 use crate::{Node, NodeError, unix_time_seconds};
 
@@ -97,7 +99,7 @@ impl SyncReport {
     }
 }
 
-/// Performs one bounded pull from a configured private peer.
+/// Performs one bounded pull from a configured peer.
 ///
 /// The remote height and work are informational hints. Every returned block is
 /// matched to the requested identifier, checked for parent order, and submitted
@@ -119,6 +121,22 @@ fn sync_from_peer_once_inner(
     limits: PeerLimits,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<SyncReport, P2pError> {
+    sync_from_peer_once_inner_with_policy(
+        shared,
+        address,
+        limits,
+        PeerAddressPolicy::PrivateOnly,
+        nonce_override,
+    )
+}
+
+fn sync_from_peer_once_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    address: SocketAddr,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<SyncReport, P2pError> {
     let (hello, locator) = {
         let node = lock_node(&shared)?;
         (node.peer_hello(), node.block_locator(MAX_BLOCKS_PER_SYNC))
@@ -126,7 +144,7 @@ fn sync_from_peer_once_inner(
     let hello = with_nonce(hello, nonce_override);
 
     let session = PeerSession::new(hello, limits)?;
-    let mut connection = PeerConnection::connect(address, session)?;
+    let mut connection = PeerConnection::connect_with_policy(address, session, address_policy)?;
     connection.send_hello()?;
     let remote_hello = expect_hello(connection.receive()?)?;
 
@@ -274,6 +292,22 @@ fn respond_to_peer_inner(
     limits: PeerLimits,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
+    respond_to_peer_inner_with_policy(
+        shared,
+        stream,
+        limits,
+        PeerAddressPolicy::PrivateOnly,
+        nonce_override,
+    )
+}
+
+fn respond_to_peer_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    stream: TcpStream,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<(), P2pError> {
     let hello = with_nonce(
         {
             let node = lock_node(&shared)?;
@@ -283,7 +317,7 @@ fn respond_to_peer_inner(
     );
     let network_id = hello.network_id;
     let session = PeerSession::new(hello, limits)?;
-    let mut connection = PeerConnection::from_stream(stream, session)?;
+    let mut connection = PeerConnection::from_stream_with_policy(stream, session, address_policy)?;
     connection.send_hello()?;
     expect_hello(connection.receive()?)?;
 
@@ -385,10 +419,35 @@ pub fn spawn_inbound_listener(
     spawn_inbound_listener_inner(shared, listener, limits, None)
 }
 
+pub fn spawn_inbound_listener_with_policy(
+    shared: Arc<Mutex<Node>>,
+    listener: TcpListener,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
+) -> Result<InboundPeerHandle, P2pError> {
+    spawn_inbound_listener_inner_with_policy(shared, listener, limits, address_policy, None)
+}
+
 fn spawn_inbound_listener_inner(
     shared: Arc<Mutex<Node>>,
     listener: TcpListener,
     limits: PeerLimits,
+    nonce_override: Option<[u8; 32]>,
+) -> Result<InboundPeerHandle, P2pError> {
+    spawn_inbound_listener_inner_with_policy(
+        shared,
+        listener,
+        limits,
+        PeerAddressPolicy::PrivateOnly,
+        nonce_override,
+    )
+}
+
+fn spawn_inbound_listener_inner_with_policy(
+    shared: Arc<Mutex<Node>>,
+    listener: TcpListener,
+    limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<InboundPeerHandle, P2pError> {
     limits.validate()?;
@@ -397,6 +456,7 @@ fn spawn_inbound_listener_inner(
         listen_address: local_address,
         peers: Vec::new(),
         limits,
+        address_policy,
     }
     .validate()?;
     listener
@@ -407,7 +467,16 @@ fn spawn_inbound_listener_inner(
     let thread_stop = Arc::clone(&stop);
     let thread = thread::Builder::new()
         .name("cmfd-peer-listener".to_owned())
-        .spawn(move || listener_loop(shared, listener, limits, thread_stop, nonce_override))
+        .spawn(move || {
+            listener_loop(
+                shared,
+                listener,
+                limits,
+                address_policy,
+                thread_stop,
+                nonce_override,
+            )
+        })
         .map_err(P2pError::ListenerIo)?;
     Ok(InboundPeerHandle {
         stop,
@@ -420,6 +489,7 @@ fn listener_loop(
     shared: Arc<Mutex<Node>>,
     listener: TcpListener,
     limits: PeerLimits,
+    address_policy: PeerAddressPolicy,
     stop: Arc<AtomicBool>,
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
@@ -447,9 +517,13 @@ fn listener_loop(
                     let _guard = ActiveConnectionGuard(worker_active);
                     // A malformed or incompatible peer closes only its own
                     // connection; it must not stop the listener.
-                    if let Err(_error) =
-                        respond_to_peer_inner(worker_node, stream, limits, nonce_override)
-                    {
+                    if let Err(_error) = respond_to_peer_inner_with_policy(
+                        worker_node,
+                        stream,
+                        limits,
+                        address_policy,
+                        nonce_override,
+                    ) {
                         #[cfg(test)]
                         eprintln!("inbound peer ended with error: {_error}");
                     }
@@ -578,10 +652,11 @@ fn static_peer_poll_loop(
             if poll_stopped(&stop) {
                 return;
             }
-            let _ = sync_from_peer_once_inner(
+            let _ = sync_from_peer_once_inner_with_policy(
                 Arc::clone(&shared),
                 *peer,
                 config.limits,
+                config.address_policy,
                 nonce_override,
             );
         }
@@ -1308,6 +1383,7 @@ mod tests {
                 listen_address: "127.0.0.1:28443".parse().unwrap(),
                 peers: vec![address],
                 limits: test_limits(),
+                address_policy: PeerAddressPolicy::PrivateOnly,
             },
             Duration::from_millis(20),
             Some(TARGET_NONCE),

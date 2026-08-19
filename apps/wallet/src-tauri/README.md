@@ -5,7 +5,7 @@ arguments, the embedded Devnet-0 node listens on `127.0.0.1:18444` and does not
 make outbound peer connections.
 
 Operators can start the packaged executable from a terminal and add one or more
-static private peers. `--peer` is repeatable. `--p2p-bind` changes the address
+static peers. `--peer` is repeatable. `--p2p-bind` changes the address
 used for inbound P2P connections; it is optional and defaults to
 `127.0.0.1:18444`. Close any running wallet first: a second launch only focuses
 the existing single-instance window and cannot change that process's peer list.
@@ -29,15 +29,40 @@ Linux AppImage:
 ```
 
 Every value must be a numeric `IP:port`. IPv6 addresses use bracket notation,
-for example `--peer [fd12:3456::12]:18444`. Only loopback, RFC1918 IPv4,
-IPv6 unique-local, and IPv6 link-local addresses with nonzero ports are
-accepted. Public addresses, unspecified addresses such as `0.0.0.0`, duplicate
-peers, and the wallet's own listener address are rejected before the embedded
-node starts.
+for example `--peer [fd12:3456::12]:18444`. Loopback, RFC1918 IPv4, IPv6
+unique-local, and IPv6 link-local addresses work by default. Public addresses
+require the explicit `--allow-public-peers` option. Unspecified addresses such
+as `0.0.0.0`, multicast/broadcast addresses, duplicate peers, zero ports, and
+the wallet's own listener address remain rejected.
 
-The Devnet-0 peer transport is neither authenticated nor encrypted. Keep these
-connections on a trusted private network; do not expose the listener to the
-public Internet.
+### Small direct-IP public test network
+
+One reachable node can act as the hub. Forward router TCP port `18444` to that
+computer's private LAN address, allow that TCP port through its firewall, and
+start the Windows wallet with:
+
+```powershell
+& 'C:\path\to\common-foundry-wallet.exe' `
+  --p2p-bind 192.168.1.50:18444 `
+  --allow-public-peers
+```
+
+Linux testers then need only the hub's public IP:
+
+```bash
+./Common-Foundry-Wallet.AppImage \
+  --allow-public-peers \
+  --peer PUBLIC_IP:18444
+```
+
+The hub's blocks and transactions are pulled by each tester. Because relay is
+pull-only, a tester who wants independently mined blocks to propagate back to
+the hub must also be reachable and configured as a reciprocal peer.
+
+The Devnet-0 P2P transport is neither authenticated nor encrypted. The public
+flag is a conspicuous, test-only opt-in; it does not provide discovery, bans,
+reputation, or DDoS resistance. Never forward RPC port `18443`, never use this
+mode for valuable funds, and stop the listener when the test is over.
 
 ## Pool configuration
 

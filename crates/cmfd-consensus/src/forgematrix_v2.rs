@@ -31,6 +31,7 @@ pub const PRODUCTION_V2_LAYERS_PER_BANK: u32 = 128;
 pub const V2_TEST_DIMENSION: u32 = 4;
 pub const V2_TEST_BATCH: u32 = 2;
 pub const V2_TEST_LAYERS: u32 = 4;
+pub const V2_ACCELERATOR_MAX_BATCH: u32 = 65_536;
 
 const CHALLENGE_DOMAIN: &str = "CMFD/FORGEMATRIX/CHALLENGE/V2";
 const MASK_DOMAIN: &str = "CMFD/FORGEMATRIX/MASKCOEFF/V2";
@@ -210,6 +211,12 @@ pub enum ForgeMatrixV2Error {
     HighHash,
     #[error("bounded compact-proof nonce range exhausted")]
     NonceExhausted,
+    #[error("accelerator batch size must be between one and the configured maximum")]
+    InvalidAcceleratorBatch,
+    #[error("accelerator output has the wrong shape")]
+    AcceleratorOutputShape,
+    #[error("accelerator result does not match authoritative full recomputation")]
+    AcceleratorMismatch,
     #[error("integer arithmetic exceeded the specified v2 bounds")]
     ArithmeticOverflow,
 }
@@ -219,6 +226,123 @@ pub struct ForgeMatrixV2Reference {
     descriptor: ForgeMatrixV2Descriptor,
     base_input: Vec<u8>,
     weights: Vec<Vec<u8>>,
+}
+
+/// Immutable, explicit model bytes supplied to an optional mining accelerator.
+///
+/// These bytes are not a proof and an accelerator is never trusted for block
+/// acceptance. Consensus code independently recomputes every candidate that an
+/// accelerator reports below a target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMatrixV2AcceleratorModel {
+    rows: u32,
+    width: u32,
+    layers: u32,
+    coefficient_count: u32,
+    base_input: Vec<u8>,
+    weights: Vec<u8>,
+}
+
+impl ForgeMatrixV2AcceleratorModel {
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn layers(&self) -> u32 {
+        self.layers
+    }
+
+    pub fn coefficient_count(&self) -> u32 {
+        self.coefficient_count
+    }
+
+    pub fn base_input(&self) -> &[u8] {
+        &self.base_input
+    }
+
+    /// Layer-major canonical model bytes in row-major matrix order.
+    pub fn weights(&self) -> &[u8] {
+        &self.weights
+    }
+
+    pub fn activation_len(&self) -> usize {
+        self.rows as usize * self.width as usize
+    }
+}
+
+/// Nonce-major mask coefficients prepared by the authoritative Rust relation.
+///
+/// The coefficient layout for each nonce is the virtual input mask followed by
+/// every real layer mask. Fields are private so callers cannot manufacture a
+/// batch that is detached from its descriptor and challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeMatrixV2AcceleratorBatch {
+    descriptor: ForgeMatrixV2Descriptor,
+    block: BlockChallenge,
+    start_nonce: u64,
+    count: u32,
+    activation_len: usize,
+    coefficient_count: usize,
+    challenges: Vec<[u8; 32]>,
+    coefficients: Vec<u8>,
+}
+
+impl ForgeMatrixV2AcceleratorBatch {
+    pub fn start_nonce(&self) -> u64 {
+        self.start_nonce
+    }
+
+    pub fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub fn activation_len(&self) -> usize {
+        self.activation_len
+    }
+
+    pub fn coefficient_count(&self) -> usize {
+        self.coefficient_count
+    }
+
+    pub fn coefficients(&self) -> &[u8] {
+        &self.coefficients
+    }
+
+    pub fn nonce_at(&self, index: usize) -> Option<u64> {
+        (index < self.count as usize).then(|| self.start_nonce.wrapping_add(index as u64))
+    }
+
+    /// Computes the digest claimed by one untrusted accelerator output.
+    ///
+    /// This is a fast target prefilter only. A below-target result must be
+    /// recomputed with [`ForgeMatrixV2Reference::prove_compact`] before use.
+    pub fn candidate_work_digest(
+        &self,
+        index: usize,
+        final_activation: &[u8],
+    ) -> Result<[u8; 32], ForgeMatrixV2Error> {
+        if index >= self.count as usize || final_activation.len() != self.activation_len {
+            return Err(ForgeMatrixV2Error::AcceleratorOutputShape);
+        }
+        if final_activation.iter().any(|value| *value > 250) {
+            return Err(ForgeMatrixV2Error::ActivationEncoding);
+        }
+        let challenge = self.challenges[index];
+        let output = output_digest(challenge, final_activation);
+        Ok(work_digest(&self.descriptor, challenge, output))
+    }
+
+    pub(crate) fn matches_statement(
+        &self,
+        descriptor: ForgeMatrixV2Descriptor,
+        block: &BlockChallenge,
+    ) -> bool {
+        self.descriptor == descriptor && self.block == *block
+    }
 }
 
 impl ForgeMatrixV2Reference {
@@ -250,6 +374,101 @@ impl ForgeMatrixV2Reference {
 
     pub fn descriptor(&self) -> ForgeMatrixV2Descriptor {
         self.descriptor
+    }
+
+    /// Returns the explicit tiny-profile model used by optional accelerators.
+    pub fn accelerator_model(&self) -> ForgeMatrixV2AcceleratorModel {
+        let rows = self.descriptor.model.batch;
+        let width = self.descriptor.model.dimension;
+        let layers = self.descriptor.model.layers;
+        let coefficient_count = 1 + rows.ilog2() + width.ilog2();
+        ForgeMatrixV2AcceleratorModel {
+            rows,
+            width,
+            layers,
+            coefficient_count,
+            base_input: self.base_input.clone(),
+            weights: self.weights.concat(),
+        }
+    }
+
+    /// Prepares authoritative challenge-dependent masks for a wrapping nonce
+    /// interval. Matrix evaluation may be delegated; digest construction and
+    /// any below-target candidate remain subject to Rust recomputation.
+    pub fn prepare_accelerator_batch(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2Error> {
+        if count == 0 || count > V2_ACCELERATOR_MAX_BATCH {
+            return Err(ForgeMatrixV2Error::InvalidAcceleratorBatch);
+        }
+        if block.network_id != self.descriptor.network_id {
+            return Err(ForgeMatrixV2Error::WrongNetwork);
+        }
+
+        let rows = self.descriptor.model.batch as usize;
+        let width = self.descriptor.model.dimension as usize;
+        let layers = self.descriptor.model.layers as usize;
+        let coefficient_count = 1 + rows.ilog2() as usize + width.ilog2() as usize;
+        let coefficients_per_nonce = (layers + 1)
+            .checked_mul(coefficient_count)
+            .ok_or(ForgeMatrixV2Error::ArithmeticOverflow)?;
+        let mut challenges = Vec::with_capacity(count as usize);
+        let mut coefficients = Vec::with_capacity(
+            (count as usize)
+                .checked_mul(coefficients_per_nonce)
+                .ok_or(ForgeMatrixV2Error::ArithmeticOverflow)?,
+        );
+
+        for offset in 0..count as u64 {
+            let nonce = start_nonce.wrapping_add(offset);
+            let challenge = challenge_digest(&self.descriptor, block, nonce)?;
+            challenges.push(challenge);
+            coefficients.extend_from_slice(&mask_coefficients(&challenge, u32::MAX, rows, width));
+            for layer in 0..layers {
+                coefficients.extend_from_slice(&mask_coefficients(
+                    &challenge,
+                    layer as u32,
+                    rows,
+                    width,
+                ));
+            }
+        }
+
+        Ok(ForgeMatrixV2AcceleratorBatch {
+            descriptor: self.descriptor,
+            block: *block,
+            start_nonce,
+            count,
+            activation_len: rows * width,
+            coefficient_count,
+            challenges,
+            coefficients,
+        })
+    }
+
+    /// Independently recomputes a below-target accelerator candidate and
+    /// rejects any disagreement in its claimed work digest.
+    pub fn verify_accelerator_candidate(
+        &self,
+        block: &BlockChallenge,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        index: usize,
+        claimed_work_digest: [u8; 32],
+    ) -> Result<ForgeMatrixV2CompactProof, ForgeMatrixV2Error> {
+        if !batch.matches_statement(self.descriptor, block) {
+            return Err(ForgeMatrixV2Error::ChallengeMismatch);
+        }
+        let nonce = batch
+            .nonce_at(index)
+            .ok_or(ForgeMatrixV2Error::AcceleratorOutputShape)?;
+        let proof = self.prove_compact(block, nonce)?;
+        if proof.work_digest != claimed_work_digest {
+            return Err(ForgeMatrixV2Error::AcceleratorMismatch);
+        }
+        Ok(proof)
     }
 
     /// Binary input for the independent CUDA v2 arithmetic oracle.
@@ -1100,6 +1319,52 @@ mod tests {
             u64::from(V2_TRANSITION_MODULUS)
                 > u64::try_from(64_005_000_i64 - (-64_000_000_i64)).unwrap()
         );
+    }
+
+    #[test]
+    fn accelerator_batches_are_bounded_wrapping_and_consensus_rechecked() {
+        let oracle = fixture();
+        let model = oracle.accelerator_model();
+        assert_eq!(model.rows(), V2_TEST_BATCH);
+        assert_eq!(model.width(), V2_TEST_DIMENSION);
+        assert_eq!(model.layers(), V2_TEST_LAYERS);
+        assert_eq!(model.activation_len(), 8);
+        assert_eq!(model.base_input().len(), 8);
+        assert_eq!(model.weights().len(), 64);
+
+        assert!(matches!(
+            oracle.prepare_accelerator_batch(&block(), 0, 0),
+            Err(ForgeMatrixV2Error::InvalidAcceleratorBatch)
+        ));
+        assert!(matches!(
+            oracle.prepare_accelerator_batch(&block(), 0, V2_ACCELERATOR_MAX_BATCH + 1),
+            Err(ForgeMatrixV2Error::InvalidAcceleratorBatch)
+        ));
+
+        let batch = oracle
+            .prepare_accelerator_batch(&block(), u64::MAX - 1, 3)
+            .unwrap();
+        assert_eq!(batch.nonce_at(0), Some(u64::MAX - 1));
+        assert_eq!(batch.nonce_at(1), Some(u64::MAX));
+        assert_eq!(batch.nonce_at(2), Some(0));
+        assert_eq!(batch.coefficient_count(), 4);
+        assert_eq!(batch.coefficients().len(), 3 * 5 * 4);
+
+        let proof = oracle.prove_reference(&block(), u64::MAX - 1).unwrap();
+        let final_bytes = activation_bytes(&proof.layers.last().unwrap().output).unwrap();
+        let claimed = batch.candidate_work_digest(0, &final_bytes).unwrap();
+        assert_eq!(claimed, proof.work_digest);
+        oracle
+            .verify_accelerator_candidate(&block(), &batch, 0, claimed)
+            .unwrap();
+
+        let mut tampered = final_bytes;
+        tampered[0] = (tampered[0] + 1) % 251;
+        let tampered_claim = batch.candidate_work_digest(0, &tampered).unwrap();
+        assert!(matches!(
+            oracle.verify_accelerator_candidate(&block(), &batch, 0, tampered_claim),
+            Err(ForgeMatrixV2Error::AcceleratorMismatch)
+        ));
     }
 
     #[test]

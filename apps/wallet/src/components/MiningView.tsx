@@ -68,6 +68,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
     : null;
   const currentHeight = metricsStatus?.current_height ?? nodeStatus?.accepted_height ?? null;
   const poolSelected = mode === "pool";
+  const cudaActive = metricsStatus?.engine === "cuda";
   const poolUrlIssue = poolUrlError(poolUrl);
   const workerNameIssue = workerNameError(workerName);
   const canStartBase = !mining.loading
@@ -149,7 +150,7 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
         <section className="mining-status-card" aria-live="polite">
           <div className="section-heading mining-heading">
             <div>
-              <span>Reference engine</span>
+              <span>{cudaActive ? "CUDA engine" : "Reference engine"}</span>
               <h2>ForgeMatrix mining</h2>
             </div>
             <span className={`mining-state${statusClass}`}>
@@ -256,8 +257,10 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
             <div>
               <span className="mining-detail-icon"><Cpu aria-hidden="true" size={18} /></span>
               <div>
-                <strong>CPU reference engine</strong>
-                <p>Runs the tiny ForgeMatrix-v2 full-recompute profile for private Devnet testing.</p>
+                <strong>{cudaActive ? "CUDA INT8 matrix engine" : "CPU reference engine"}</strong>
+                <p>{cudaActive
+                  ? `Runs the Devnet ForgeMatrix-v2 matrix stage on ${metricsStatus?.device ?? "the selected NVIDIA GPU"}; Rust recomputes every candidate before submission.`
+                  : "Runs the tiny ForgeMatrix-v2 full-recompute profile for private Devnet testing."}</p>
               </div>
             </div>
             <div>
@@ -277,7 +280,9 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           </div>
           <div className="warning-inline mining-proof-warning">
             <AlertTriangle aria-hidden="true" size={17} />
-            <span>This reference engine makes no GPU-use or VRAM-residency claim. Those physical properties are not proven by consensus.</span>
+            <span>{cudaActive
+              ? "This wallet is using CUDA locally, but consensus validates only the committed result; it cannot prove physical GPU or VRAM residency."
+              : "This reference engine makes no GPU-use or VRAM-residency claim. Those physical properties are not proven by consensus."}</span>
           </div>
         </section>
       </div>
@@ -384,7 +389,9 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
               <span className="mining-detail-icon"><Gauge aria-hidden="true" size={17} /></span>
               <div>
                 <span>Engine</span>
-                <strong>CPU reference evaluator</strong>
+                <strong>{cudaActive
+                  ? metricsStatus?.device ?? "CUDA accelerator"
+                  : "CPU reference evaluator"}</strong>
               </div>
             </div>
           </>
@@ -412,8 +419,8 @@ export function MiningView({ wallet, nodeStatus }: MiningViewProps) {
           {buttonText}
         </button>
         <small>{poolSelected
-          ? "Private Devnet-0 only · session accounting only · no GPU-use claim"
-          : "Private Devnet-0 only · valueless funds · reference performance"}</small>
+          ? `Private Devnet-0 only · session accounting only · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`
+          : `Private Devnet-0 only · valueless funds · ${cudaActive ? "CUDA matrix stage" : "CPU reference"}`}</small>
       </aside>
     </div>
   );

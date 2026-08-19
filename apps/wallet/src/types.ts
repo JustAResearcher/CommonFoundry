@@ -14,6 +14,7 @@ export interface NodeStatus {
   mempool_transactions: number;
   mempool_bytes: number;
   storage_healthy: boolean;
+  public_peer_mode: boolean;
 }
 
 export interface WalletBalances {

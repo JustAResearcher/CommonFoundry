@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::{
     BlockChallenge, ForgeMatrixError, ForgeMatrixProfile, ForgeMatrixProof,
-    ForgeMatrixV2CompactProof, ForgeMatrixV2Descriptor, ForgeMatrixV2Error, ForgeMatrixV2Reference,
-    ForgeMatrixVerifier,
+    ForgeMatrixV2AcceleratorBatch, ForgeMatrixV2AcceleratorModel, ForgeMatrixV2CompactProof,
+    ForgeMatrixV2Descriptor, ForgeMatrixV2Error, ForgeMatrixV2Reference, ForgeMatrixVerifier,
 };
 
 pub const POW_TYPE_V1_LEGACY: u16 = 1;
@@ -176,6 +176,60 @@ impl ConsensusPowVerifier {
             Self::V2Reference(reference) => Ok(BlockProof::V2Reference(
                 reference.prove_compact(block, nonce)?,
             )),
+        }
+    }
+
+    /// Returns the explicit tiny v2 model for an optional untrusted mining
+    /// accelerator. Legacy v1 has no accelerator contract.
+    pub fn v2_accelerator_model(&self) -> Result<ForgeMatrixV2AcceleratorModel, PowError> {
+        match self {
+            Self::V2Reference(reference) => Ok(reference.accelerator_model()),
+            Self::V1Legacy(_) => Err(PowError::WrongProofType),
+        }
+    }
+
+    pub fn prepare_v2_accelerator_batch(
+        &self,
+        block: &BlockChallenge,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV2AcceleratorBatch, PowError> {
+        match self {
+            Self::V2Reference(reference) => {
+                Ok(reference.prepare_accelerator_batch(block, start_nonce, count)?)
+            }
+            Self::V1Legacy(_) => Err(PowError::WrongProofType),
+        }
+    }
+
+    pub fn verify_v2_accelerator_candidate(
+        &self,
+        block: &BlockChallenge,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        index: usize,
+        claimed_work_digest: [u8; 32],
+    ) -> Result<BlockProof, PowError> {
+        match self {
+            Self::V2Reference(reference) => Ok(BlockProof::V2Reference(
+                reference.verify_accelerator_candidate(block, batch, index, claimed_work_digest)?,
+            )),
+            Self::V1Legacy(_) => Err(PowError::WrongProofType),
+        }
+    }
+
+    pub fn validate_v2_accelerator_batch(
+        &self,
+        block: &BlockChallenge,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+    ) -> Result<(), PowError> {
+        match self {
+            Self::V2Reference(reference)
+                if batch.matches_statement(reference.descriptor(), block) =>
+            {
+                Ok(())
+            }
+            Self::V2Reference(_) => Err(PowError::ParameterMismatch),
+            Self::V1Legacy(_) => Err(PowError::WrongProofType),
         }
     }
 

@@ -1,4 +1,5 @@
 mod commands;
+mod cuda;
 mod mining;
 mod runtime;
 

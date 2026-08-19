@@ -64,15 +64,26 @@ To run the separate CUDA arithmetic smoke tests:
 .\scripts\test-cuda.ps1 -Version v2
 ```
 
+The optional wallet miner backend is a different, batched CUDA path. Build its
+20/30/40/50-series fat library and run the CPU/CUDA differential canary with:
+
+```powershell
+.\scripts\build-cuda-miner.ps1
+```
+
+See [ForgeMatrix v2 CUDA miner](docs/cuda-miner.md) for the exact trust
+boundary, supported architectures, wallet packaging, and tester procedure.
+
 `profile16gb` reports the disabled, seed-based v1 candidate; it is not the v2
 profile. The v2 CLI/test paths are deliberately capped to tiny research shapes
 so every vector can be recomputed quickly on an ordinary CPU.
 
-## Private Devnet-0
+## Devnet-0
 
-`cmfd-node` is a private multi-node Devnet-0 runtime. RPC stays loopback-only;
-P2P listeners and explicitly configured static peers are limited to loopback or
-private addresses. From a Windows PowerShell prompt in the repository root:
+`cmfd-node` is a bounded multi-node Devnet-0 runtime. RPC stays loopback-only.
+P2P defaults to loopback or private addresses; public numeric addresses require
+the explicit `--allow-public-peers` test-only flag. From a Windows PowerShell
+prompt in the repository root:
 
 ```powershell
 cargo run -p cmfd-node -- mine-once
@@ -89,6 +100,12 @@ rules; transaction propagation is pull-only rather than a push broadcast. Each
 block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
+
+For a small direct-IP test network, forward TCP `18444` on one router to the
+node's private LAN address, start that hub with `--allow-public-peers`, and have
+testers add `--allow-public-peers --peer PUBLIC_IP:18444`. Never forward RPC
+port `18443`. Public P2P remains unauthenticated and unencrypted, with no peer
+discovery, ban system, or demonstrated DDoS resistance.
 
 ### Local Devnet wallet
 
@@ -114,11 +131,13 @@ requests under `/rpc` to `http://127.0.0.1:18443`; the node RPC is not exposed
 directly to the browser or public network.
 
 The wallet reads real active-chain balances and history, displays the receive
-destination, creates signed sends, runs a cancellable continuous Devnet
-reference solo miner, and consolidates mining outputs through the embedded
-node. Mining reports exact ForgeMatrix matrix evaluations per second, not a
-GPU hashrate. Mined rewards require 100 confirmations before they are
-spendable. Consolidation selects mature, unreserved outputs in smallest-first
+destination, creates signed sends, runs cancellable continuous Solo or Pool
+mining, and consolidates mining outputs through the embedded node. With the
+optional CUDA library present, the wallet accelerates the INT8 matrix stage on
+one NVIDIA GPU; otherwise it uses the CPU reference evaluator. Every CUDA
+candidate is fully recomputed in Rust before submission. Mining reports
+complete ForgeMatrix nonce attempts per second, not raw GPU TOPS. Mined rewards
+require 100 confirmations before they are spendable. Consolidation selects mature, unreserved outputs in smallest-first
 order, accepts 2 through 128 inputs, creates one wallet output, and burns the
 chosen transaction fee.
 

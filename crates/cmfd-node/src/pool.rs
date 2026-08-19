@@ -17,7 +17,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use cmfd_consensus::forgematrix::target_with_leading_zero_bits;
-use cmfd_consensus::{BlockChallenge, ConsensusPowVerifier, PowError, v2_test_reference};
+use cmfd_consensus::{
+    BlockChallenge, ConsensusPowVerifier, ForgeMatrixV2AcceleratorBatch,
+    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2Error, PowError, v2_test_reference,
+};
 use k256::schnorr::VerifyingKey;
 use rcgen::generate_simple_self_signed;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -286,6 +289,90 @@ impl PoolMiningWork {
 
     pub fn job(&self) -> &PoolJob {
         &self.job
+    }
+
+    pub fn accelerator_model(&self) -> Result<ForgeMatrixV2AcceleratorModel, PoolError> {
+        Ok(self.verifier.v2_accelerator_model()?)
+    }
+
+    pub fn prepare_accelerator_batch(
+        &self,
+        start_nonce: u64,
+        count: u32,
+    ) -> Result<ForgeMatrixV2AcceleratorBatch, PoolError> {
+        Ok(self
+            .verifier
+            .prepare_v2_accelerator_batch(&self.job.challenge, start_nonce, count)?)
+    }
+
+    pub fn verify_accelerator_output(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        index: usize,
+        output: &[u8],
+    ) -> Result<[u8; 32], PoolError> {
+        self.verifier
+            .validate_v2_accelerator_batch(&self.job.challenge, batch)?;
+        let work_digest = batch
+            .candidate_work_digest(index, output)
+            .map_err(PowError::from)?;
+        self.verifier.verify_v2_accelerator_candidate(
+            &self.job.challenge,
+            batch,
+            index,
+            work_digest,
+        )?;
+        Ok(work_digest)
+    }
+
+    /// Scans untrusted accelerator outputs and fully recomputes any claimed
+    /// share before returning it to the pool client.
+    pub fn complete_accelerator_batch(
+        &self,
+        batch: &ForgeMatrixV2AcceleratorBatch,
+        outputs: &[u8],
+    ) -> Result<PoolWorkSearchResult, PoolError> {
+        self.verifier
+            .validate_v2_accelerator_batch(&self.job.challenge, batch)?;
+        let expected_len = batch
+            .count()
+            .checked_mul(batch.activation_len() as u32)
+            .map(|length| length as usize)
+            .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+        if outputs.len() != expected_len {
+            return Err(PoolError::Pow(PowError::V2(
+                ForgeMatrixV2Error::AcceleratorOutputShape,
+            )));
+        }
+
+        for (index, output) in outputs.chunks_exact(batch.activation_len()).enumerate() {
+            let work_digest = batch
+                .candidate_work_digest(index, output)
+                .map_err(PowError::from)?;
+            if work_digest <= self.job.share_target {
+                self.verifier.verify_v2_accelerator_candidate(
+                    &self.job.challenge,
+                    batch,
+                    index,
+                    work_digest,
+                )?;
+                let nonce = batch
+                    .nonce_at(index)
+                    .ok_or(PowError::V2(ForgeMatrixV2Error::AcceleratorOutputShape))?;
+                return Ok(PoolWorkSearchResult::Found {
+                    nonce,
+                    work_digest,
+                    meets_chain_target: work_digest <= self.job.challenge.target,
+                    attempts_completed: index as u64 + 1,
+                    next_nonce: nonce.wrapping_add(1),
+                });
+            }
+        }
+
+        Ok(PoolWorkSearchResult::Exhausted {
+            attempts_completed: batch.count().into(),
+            next_nonce: batch.start_nonce().wrapping_add(u64::from(batch.count())),
+        })
     }
 
     pub fn search_range<F>(

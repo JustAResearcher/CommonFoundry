@@ -76,6 +76,13 @@ export function NetworkView({ status, wallet, mempool, refreshing, onRefresh, on
           <span className={`service-state${status ? " is-online" : ""}`}>{status ? "Online" : "Offline"}</span>
         </div>
 
+        {status?.public_peer_mode ? (
+          <div className="warning-inline" role="alert">
+            <ShieldAlert aria-hidden="true" size={17} />
+            <span>Public Devnet P2P is enabled. It is unauthenticated and unencrypted; keep RPC on loopback and expect hostile traffic.</span>
+          </div>
+        ) : null}
+
         <dl className="diagnostics-grid">
           <Diagnostic label="Network" value={status?.network ?? "—"} />
           <Diagnostic label="Proof of work" value={status?.proof_of_work ?? "—"} />

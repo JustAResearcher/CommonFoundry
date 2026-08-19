@@ -27,10 +27,11 @@ pub use forgematrix::{
     ProfileMetrics, TEST_PROFILE,
 };
 pub use forgematrix_v2::{
-    FORGEMATRIX_V2_ALGORITHM_VERSION, FORGEMATRIX_V2_PROOF_VERSION, ForgeMatrixV2CompactProof,
-    ForgeMatrixV2Descriptor, ForgeMatrixV2Error, ForgeMatrixV2Reference,
-    ForgeMatrixV2ReferenceProof, LayerWitness, PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH,
-    PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS, PRODUCTION_V2_LAYERS_PER_BANK, ReductionWitness,
+    FORGEMATRIX_V2_ALGORITHM_VERSION, FORGEMATRIX_V2_PROOF_VERSION, ForgeMatrixV2AcceleratorBatch,
+    ForgeMatrixV2AcceleratorModel, ForgeMatrixV2CompactProof, ForgeMatrixV2Descriptor,
+    ForgeMatrixV2Error, ForgeMatrixV2Reference, ForgeMatrixV2ReferenceProof, LayerWitness,
+    PRODUCTION_V2_BANKS, PRODUCTION_V2_BATCH, PRODUCTION_V2_DIMENSION, PRODUCTION_V2_LAYERS,
+    PRODUCTION_V2_LAYERS_PER_BANK, ReductionWitness, V2_ACCELERATOR_MAX_BATCH,
     V2_REFERENCE_MAX_BATCH, V2_REFERENCE_MAX_DIMENSION, V2_REFERENCE_MAX_LAYERS, V2_TEST_BATCH,
     V2_TEST_DIMENSION, V2_TEST_LAYERS, V2_TRANSITION_MODULUS, v2_test_reference,
 };

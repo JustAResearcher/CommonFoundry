@@ -37,15 +37,19 @@ Mainnet remains disabled until all of the following are complete:
    replay, proof malleability, target confusion, and CPU/GPU arithmetic
    divergence.
 
-Devnet-0 now has bounded private-address static-peer sessions, full block
+Devnet-0 now has bounded static-peer sessions, full block
 validation before indexing, cumulative-chainwork fork choice and reorgs, a
 checksummed append-only block log with consensus replay, touched-state atomic
 active-chain validation, a bounded volatile mempool with pull-only static peer
 propagation, and a bounded CMFD-specific pool test protocol. Those features
-make it a private multi-node test harness; they do not make it safe for public
-peers or valuable funds.
+make it a multi-node test harness; they do not make it safe for valuable funds.
+Loopback/private addresses remain the default. An explicit
+`--allow-public-peers` flag permits numeric public P2P addresses for bounded,
+valueless testing, but does not add authentication, encryption, reputation,
+automatic bans, NAT traversal, or DDoS resistance. RPC remains loopback-only,
+`0.0.0.0` remains invalid, and operators should expose only TCP P2P port 18444.
 
-Before any untrusted public testnet, the networking and storage design needs
+Before any public-value or broadly advertised public testnet, the networking and storage design needs
 explicit abuse, latency, and crash-recovery bounds. Peers are statically
 configured and compatibility-checked by network ID and consensus fingerprint,
 but are not identity-authenticated; P2P transport is unencrypted, with no peer
@@ -72,9 +76,12 @@ command allowlist to its bundled webview. It does not open the loopback HTTP RPC
 listener. The browser developer workflow still uses the loopback Vite proxy and
 inherits the RPC limitations documented in the Devnet guide.
 
-Continuous desktop mining uses the tiny CPU full-recomputation profile. Its
-performance counter is a count of complete ForgeMatrix nonce evaluations, not
-a GPU hashrate or proof of physical VRAM residency.
+Continuous desktop mining uses the tiny full-recomputation Devnet profile. It
+can optionally delegate the INT8 matrix stage to a CUDA library, but Rust fully
+recomputes every below-target candidate before block submission or pool credit.
+The performance counter is complete ForgeMatrix nonce evaluations, not raw GPU
+TOPS or proof of physical VRAM residency. A missing or failed CUDA backend falls
+back to the CPU evaluator and is reported in wallet status.
 
 The Devnet pool is a CMFD-specific length-bounded job/share protocol over TLS
 1.3; it is not Stratum. A client authenticates the server by comparing the
