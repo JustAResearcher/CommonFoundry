@@ -251,6 +251,7 @@ pub struct NodeStatus {
     pub mempool_transactions: usize,
     pub mempool_bytes: usize,
     pub storage_healthy: bool,
+    pub public_peer_mode: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -759,6 +760,7 @@ pub struct Node {
     mempool_bytes: usize,
     log: File,
     storage_faulted: bool,
+    public_peer_mode: bool,
     _lock: DataDirLock,
 }
 
@@ -949,6 +951,7 @@ impl Node {
             mempool_bytes: 0,
             log,
             storage_faulted: false,
+            public_peer_mode: false,
             _lock: lock,
         })
     }
@@ -959,6 +962,10 @@ impl Node {
 
     pub fn wallet_destination(&self) -> [u8; 32] {
         self.wallet_signing_key.verifying_key().to_bytes().into()
+    }
+
+    pub fn set_public_peer_mode(&mut self, enabled: bool) {
+        self.public_peer_mode = enabled;
     }
 
     fn wallet_warning(&self) -> &'static str {
@@ -984,6 +991,7 @@ impl Node {
             mempool_transactions: self.mempool.len(),
             mempool_bytes: self.mempool_bytes,
             storage_healthy: !self.storage_faulted,
+            public_peer_mode: self.public_peer_mode,
         })
     }
 
@@ -3502,6 +3510,22 @@ mod tests {
             ChainState::new(params, legacy),
             Err(ChainError::PowParameterMismatch)
         ));
+    }
+
+    #[test]
+    fn public_peer_mode_is_runtime_only_and_visible_in_status() {
+        let path = test_dir("public-peer-status");
+        clean_test_dir(&path);
+        let mut node = Node::open(&path).unwrap();
+        assert!(!node.status().unwrap().public_peer_mode);
+        node.set_public_peer_mode(true);
+        assert!(node.status().unwrap().public_peer_mode);
+        drop(node);
+
+        let reopened = Node::open(&path).unwrap();
+        assert!(!reopened.status().unwrap().public_peer_mode);
+        drop(reopened);
+        clean_test_dir(&path);
     }
 
     #[test]

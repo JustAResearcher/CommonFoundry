@@ -37,15 +37,19 @@ Mainnet remains disabled until all of the following are complete:
    replay, proof malleability, target confusion, and CPU/GPU arithmetic
    divergence.
 
-Devnet-0 now has bounded private-address static-peer sessions, full block
+Devnet-0 now has bounded static-peer sessions, full block
 validation before indexing, cumulative-chainwork fork choice and reorgs, a
 checksummed append-only block log with consensus replay, touched-state atomic
 active-chain validation, a bounded volatile mempool with pull-only static peer
 propagation, and a bounded CMFD-specific pool test protocol. Those features
-make it a private multi-node test harness; they do not make it safe for public
-peers or valuable funds.
+make it a multi-node test harness; they do not make it safe for valuable funds.
+Loopback/private addresses remain the default. An explicit
+`--allow-public-peers` flag permits numeric public P2P addresses for bounded,
+valueless testing, but does not add authentication, encryption, reputation,
+automatic bans, NAT traversal, or DDoS resistance. RPC remains loopback-only,
+`0.0.0.0` remains invalid, and operators should expose only TCP P2P port 18444.
 
-Before any untrusted public testnet, the networking and storage design needs
+Before any public-value or broadly advertised public testnet, the networking and storage design needs
 explicit abuse, latency, and crash-recovery bounds. Peers are statically
 configured and compatibility-checked by network ID and consensus fingerprint,
 but are not identity-authenticated; P2P transport is unencrypted, with no peer

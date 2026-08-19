@@ -78,11 +78,12 @@ boundary, supported architectures, wallet packaging, and tester procedure.
 profile. The v2 CLI/test paths are deliberately capped to tiny research shapes
 so every vector can be recomputed quickly on an ordinary CPU.
 
-## Private Devnet-0
+## Devnet-0
 
-`cmfd-node` is a private multi-node Devnet-0 runtime. RPC stays loopback-only;
-P2P listeners and explicitly configured static peers are limited to loopback or
-private addresses. From a Windows PowerShell prompt in the repository root:
+`cmfd-node` is a bounded multi-node Devnet-0 runtime. RPC stays loopback-only.
+P2P defaults to loopback or private addresses; public numeric addresses require
+the explicit `--allow-public-peers` test-only flag. From a Windows PowerShell
+prompt in the repository root:
 
 ```powershell
 cargo run -p cmfd-node -- mine-once
@@ -99,6 +100,12 @@ rules; transaction propagation is pull-only rather than a push broadcast. Each
 block is fully validated before it is indexed, the active branch is selected by
 strictly greater cumulative work, and the checksummed block log is replayed on
 startup to reconstruct forks and the active tip.
+
+For a small direct-IP test network, forward TCP `18444` on one router to the
+node's private LAN address, start that hub with `--allow-public-peers`, and have
+testers add `--allow-public-peers --peer PUBLIC_IP:18444`. Never forward RPC
+port `18443`. Public P2P remains unauthenticated and unencrypted, with no peer
+discovery, ban system, or demonstrated DDoS resistance.
 
 ### Local Devnet wallet
 

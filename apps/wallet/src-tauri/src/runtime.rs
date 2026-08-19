@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cmfd_node::p2p::{
-    InboundPeerHandle, StaticPeerPollHandle, spawn_inbound_listener, spawn_static_peer_polling,
+    InboundPeerHandle, StaticPeerPollHandle, spawn_inbound_listener_with_policy,
+    spawn_static_peer_polling,
 };
 use cmfd_node::peer::PeerLimits;
 use cmfd_node::{Node, NodeClientError};
@@ -124,7 +125,8 @@ fn start_embedded_node<R: Runtime>(
             )
         })?
         .join("devnet-0");
-    let node = Node::open(data_dir).map_err(|error| error.client_error())?;
+    let mut node = Node::open(data_dir).map_err(|error| error.client_error())?;
+    node.set_public_peer_mode(config.allow_public_peers);
     let shared = Arc::new(Mutex::new(node));
     let listener = TcpListener::bind(config.p2p_bind).map_err(|_| {
         startup_error(
@@ -144,7 +146,13 @@ fn start_embedded_node<R: Runtime>(
         )
     })?;
     let limits = PeerLimits::default();
-    let inbound = spawn_inbound_listener(Arc::clone(&shared), listener, limits).map_err(|_| {
+    let inbound = spawn_inbound_listener_with_policy(
+        Arc::clone(&shared),
+        listener,
+        limits,
+        config.address_policy(),
+    )
+    .map_err(|_| {
         startup_error(
             "p2p_start_failed",
             "The embedded Devnet peer service could not start. Reopen the wallet and try again.",
@@ -166,7 +174,7 @@ fn start_embedded_node<R: Runtime>(
                 let _ = inbound.stop();
                 return Err(startup_error(
                     "static_peer_poller_start_failed",
-                    "The embedded node could not start outbound Devnet peer polling. Check the private peer configuration, then reopen the wallet.",
+                    "The embedded node could not start outbound Devnet peer polling. Check the peer configuration, then reopen the wallet.",
                     true,
                 ));
             }

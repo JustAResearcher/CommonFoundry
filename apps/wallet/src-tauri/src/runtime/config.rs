@@ -2,12 +2,13 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use cmfd_node::DEFAULT_P2P_ADDRESS;
-use cmfd_node::peer::{PeerLimits, StaticPeerConfig};
+use cmfd_node::peer::{PeerAddressPolicy, PeerLimits, StaticPeerConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NodeRuntimeConfig {
     pub(super) p2p_bind: SocketAddr,
     pub(super) peers: Vec<SocketAddr>,
+    pub(super) allow_public_peers: bool,
 }
 
 impl NodeRuntimeConfig {
@@ -32,6 +33,7 @@ impl NodeRuntimeConfig {
             .map_err(|_| ConfigError::InvalidBuiltInDefault)?;
         let mut p2p_bind = None;
         let mut peers = Vec::new();
+        let mut allow_public_peers = false;
         let mut arguments = arguments.into_iter().map(Into::into);
 
         while let Some(argument) = arguments.next() {
@@ -50,6 +52,12 @@ impl NodeRuntimeConfig {
                         .next()
                         .ok_or(ConfigError::MissingValue("--peer"))?;
                     peers.push(parse_address("--peer", &value)?);
+                }
+                "--allow-public-peers" => {
+                    if allow_public_peers {
+                        return Err(ConfigError::DuplicateOption("--allow-public-peers"));
+                    }
+                    allow_public_peers = true;
                 }
                 _ if argument.starts_with("--p2p-bind=") => {
                     if p2p_bind.is_some() {
@@ -73,6 +81,7 @@ impl NodeRuntimeConfig {
         let config = Self {
             p2p_bind: p2p_bind.unwrap_or(default_bind),
             peers,
+            allow_public_peers,
         };
         config.static_peers(PeerLimits::default()).validate()?;
         Ok(config)
@@ -83,6 +92,15 @@ impl NodeRuntimeConfig {
             listen_address: self.p2p_bind,
             peers: self.peers.clone(),
             limits,
+            address_policy: self.address_policy(),
+        }
+    }
+
+    pub(super) fn address_policy(&self) -> PeerAddressPolicy {
+        if self.allow_public_peers {
+            PeerAddressPolicy::AllowPublic
+        } else {
+            PeerAddressPolicy::PrivateOnly
         }
     }
 }
@@ -102,12 +120,12 @@ pub(super) enum ConfigError {
     MissingValue(&'static str),
     DuplicateOption(&'static str),
     InvalidAddress { option: &'static str, value: String },
-    InvalidPrivatePeerConfiguration(String),
+    InvalidPeerConfiguration(String),
 }
 
 impl From<cmfd_node::peer::PeerError> for ConfigError {
     fn from(error: cmfd_node::peer::PeerError) -> Self {
-        Self::InvalidPrivatePeerConfiguration(error.to_string())
+        Self::InvalidPeerConfiguration(error.to_string())
     }
 }
 
@@ -133,7 +151,7 @@ impl fmt::Display for ConfigError {
                     "{option} requires a numeric IP:port, received {value}"
                 )
             }
-            Self::InvalidPrivatePeerConfiguration(message) => formatter.write_str(message),
+            Self::InvalidPeerConfiguration(message) => formatter.write_str(message),
         }
     }
 }
@@ -148,6 +166,7 @@ mod tests {
 
         assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
         assert!(config.peers.is_empty());
+        assert!(!config.allow_public_peers);
     }
 
     #[test]
@@ -182,11 +201,34 @@ mod tests {
             assert!(
                 matches!(
                     NodeRuntimeConfig::parse(arguments),
-                    Err(ConfigError::InvalidPrivatePeerConfiguration(_))
+                    Err(ConfigError::InvalidPeerConfiguration(_))
                 ),
                 "configuration unexpectedly passed validation"
             );
         }
+    }
+
+    #[test]
+    fn public_peers_require_explicit_opt_in_and_unsafe_binds_stay_rejected() {
+        let config = NodeRuntimeConfig::parse([
+            "--allow-public-peers",
+            "--p2p-bind",
+            "192.168.50.10:18444",
+            "--peer",
+            "8.8.8.8:18444",
+        ])
+        .unwrap();
+        assert!(config.allow_public_peers);
+        assert_eq!(config.peers, ["8.8.8.8:18444".parse().unwrap()]);
+
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--allow-public-peers", "--p2p-bind", "0.0.0.0:18444"]),
+            Err(ConfigError::InvalidPeerConfiguration(_))
+        ));
+        assert!(matches!(
+            NodeRuntimeConfig::parse(["--allow-public-peers", "--allow-public-peers"]),
+            Err(ConfigError::DuplicateOption("--allow-public-peers"))
+        ));
     }
 
     #[test]
