@@ -120,7 +120,14 @@ impl RuntimeState {
 fn start_embedded_node<R: Runtime>(
     app: &App<R>,
     config: NodeRuntimeConfig,
-) -> Result<(Arc<Mutex<Node>>, ServiceHandles, cmfd_node::logging::WorkerGuard), NodeClientError> {
+) -> Result<
+    (
+        Arc<Mutex<Node>>,
+        ServiceHandles,
+        cmfd_node::logging::WorkerGuard,
+    ),
+    NodeClientError,
+> {
     let data_dir = app
         .path()
         .app_local_data_dir()

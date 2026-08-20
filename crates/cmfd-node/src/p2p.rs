@@ -589,7 +589,8 @@ fn respond_to_peer_inner_with_policy(
     nonce_override: Option<[u8; 32]>,
 ) -> Result<(), P2pError> {
     let remote_address = stream.peer_addr().map_err(P2pError::ListenerIo)?;
-    let span = tracing::info_span!("respond_to_peer", peer = %remote_address, direction = "inbound");
+    let span =
+        tracing::info_span!("respond_to_peer", peer = %remote_address, direction = "inbound");
     let _entered = span.enter();
     let observation_address = observed_address(PeerDirection::Inbound, remote_address);
     record_peer_started(&shared, PeerDirection::Inbound, observation_address.clone());

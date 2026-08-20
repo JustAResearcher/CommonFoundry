@@ -192,10 +192,7 @@ mod tests {
 
     #[test]
     fn verbosity_counts_repeated_and_bundled_short_flags() {
-        assert_eq!(
-            NodeRuntimeConfig::parse(["--verbose"]).unwrap().verbose,
-            1
-        );
+        assert_eq!(NodeRuntimeConfig::parse(["--verbose"]).unwrap().verbose, 1);
         assert_eq!(NodeRuntimeConfig::parse(["-v"]).unwrap().verbose, 1);
         assert_eq!(NodeRuntimeConfig::parse(["-vv"]).unwrap().verbose, 2);
         assert_eq!(NodeRuntimeConfig::parse(["-vvv"]).unwrap().verbose, 3);
