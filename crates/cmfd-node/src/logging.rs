@@ -19,7 +19,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 /// Env vars honored for a per-module filter override (`cmfd_node::p2p=trace`),
 /// checked in this order ahead of the `-v` count.
-const LOG_ENV_VARS: [&str; 2] = ["MEOWCOIN_LOG", "RUST_LOG"];
+const LOG_ENV_VARS: [&str; 2] = ["CMFD_LOG", "RUST_LOG"];
 
 /// File log lines are always emitted at debug level or above, independent of
 /// the console verbosity, so a failure that happens unattended is still on
